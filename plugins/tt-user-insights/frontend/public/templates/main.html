@@ -1,0 +1,831 @@
+<div class="cly-vue-content cly-vue-tt-insights">
+    <!-- Page Header & Main Mode Switcher (User Inspector vs PostHog-style Live Events Stream) -->
+    <div class="cly-vue-tt-insights__header bu-level bu-mb-4">
+        <div class="bu-level-left">
+            <div>
+                <h2 class="bu-title bu-is-4 bu-mb-1">{{ i18n('tt-user-insights.title') }}</h2>
+                <p class="bu-subtitle bu-is-6 has-text-grey">{{ i18n('tt-user-insights.subtitle') }}</p>
+            </div>
+        </div>
+        <div class="bu-level-right">
+            <div class="bu-buttons has-addons">
+                <button class="bu-button bu-is-small"
+                    :class="activeMainTab === 'users' ? 'bu-is-info is-selected' : 'bu-is-light'"
+                    @click="onSwitchMainTab('users')">
+                    <span>👤 {{ i18n('tt-user-insights.nav.user_inspector') }}</span>
+                </button>
+                <button class="bu-button bu-is-small"
+                    :class="activeMainTab === 'live' ? 'bu-is-success is-selected' : 'bu-is-light'"
+                    @click="onSwitchMainTab('live')">
+                    <span class="cly-vue-tt-insights__live-dot"
+                        :class="{ 'is-pulsing': activeMainTab === 'live' && !liveStreamPaused }"></span>
+                    <span>⚡ {{ i18n('tt-user-insights.nav.live_stream') }}</span>
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ======================================================================= -->
+    <!-- MODE 1: USER INSPECTOR & CHRONOLOGICAL ACTIVITY TIMELINE                -->
+    <!-- ======================================================================= -->
+    <div v-if="activeMainTab === 'users'" class="bu-columns">
+        <!-- LEFT COLUMN: User Search & Selection List -->
+        <div class="bu-column bu-is-4">
+            <div class="bu-box cly-vue-tt-insights__panel">
+                <h3 class="bu-title bu-is-6 bu-mb-3">{{ i18n('tt-user-insights.search.title') }}</h3>
+
+                <!-- Search Mode Selector -->
+                <div class="bu-field bu-mb-2">
+                    <div class="bu-control">
+                        <div class="bu-select bu-is-fullwidth bu-is-small">
+                            <select v-model="searchFieldMode">
+                                <option value="all">{{ i18n('tt-user-insights.search.mode.all') }}</option>
+                                <option value="device_id">{{ i18n('tt-user-insights.search.mode.device_id') }}</option>
+                                <option value="uid">{{ i18n('tt-user-insights.search.mode.uid') }}</option>
+                                <option value="name">{{ i18n('tt-user-insights.search.mode.name') }}</option>
+                                <option value="email">{{ i18n('tt-user-insights.search.mode.email') }}</option>
+                                <option value="custom">{{ i18n('tt-user-insights.search.mode.custom') }}</option>
+                            </select>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Standard Search Input -->
+                <div v-if="searchFieldMode !== 'custom'" class="bu-field bu-has-addons bu-mb-3">
+                    <div class="bu-control bu-is-expanded">
+                        <input class="bu-input bu-is-small" type="text" v-model="searchQuery"
+                            :placeholder="i18n('tt-user-insights.search.placeholder')" @keyup.enter="onSearchUsers" />
+                    </div>
+                    <div class="bu-control">
+                        <button class="bu-button bu-is-small bu-is-success" @click="onSearchUsers">
+                            {{ i18n('tt-user-insights.search.button') }}
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Custom Property Search Inputs -->
+                <div v-else class="bu-mb-3">
+                    <div class="bu-field bu-mb-2">
+                        <input class="bu-input bu-is-small" type="text" v-model="customPropKey"
+                            :placeholder="i18n('tt-user-insights.search.custom_key_placeholder')"
+                            @keyup.enter="onSearchUsers" />
+                    </div>
+                    <div class="bu-field bu-has-addons">
+                        <div class="bu-control bu-is-expanded">
+                            <input class="bu-input bu-is-small" type="text" v-model="customPropValue"
+                                :placeholder="i18n('tt-user-insights.search.custom_value_placeholder')"
+                                @keyup.enter="onSearchUsers" />
+                        </div>
+                        <div class="bu-control">
+                            <button class="bu-button bu-is-small bu-is-success" @click="onSearchUsers">
+                                {{ i18n('tt-user-insights.search.button') }}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Users Error State -->
+                <div v-if="usersError" class="bu-notification bu-is-danger bu-is-light bu-p-3 bu-mb-3">
+                    {{ usersError }}
+                </div>
+
+                <!-- Users Loading State -->
+                <div v-if="usersLoading" class="cly-vue-tt-insights__state bu-has-text-centered bu-py-5">
+                    <span>{{ i18n('tt-user-insights.state.loading_users') }}</span>
+                </div>
+
+                <!-- Users Empty State -->
+                <div v-else-if="!users.length" class="cly-vue-tt-insights__state bu-has-text-centered bu-py-5">
+                    <p class="has-text-grey">{{ i18n('tt-user-insights.state.no_users') }}</p>
+                    <button v-if="searchQuery || customPropKey" class="bu-button bu-is-small bu-is-text bu-mt-2"
+                        @click="onResetUserSearch">
+                        {{ i18n('tt-user-insights.filter.reset') }}
+                    </button>
+                </div>
+
+                <!-- Users Result List -->
+                <div v-else class="cly-vue-tt-insights__user-list">
+                    <div v-for="u in users" :key="u.uid || u.deviceId" class="cly-vue-tt-insights__user-card"
+                        :class="{ 'is-active': selectedUser && ((selectedUser.uid && selectedUser.uid === u.uid) || (selectedUser.deviceId && selectedUser.deviceId === u.deviceId)) }"
+                        @click="onSelectUser(u)">
+                        <div class="cly-vue-tt-insights__user-card-header">
+                            <strong class="cly-vue-tt-insights__user-name">{{ u.displayName || u.uid || u.deviceId
+                                }}</strong>
+                            <span v-if="u.country" class="bu-tag bu-is-light bu-is-small">{{ u.country }}</span>
+                        </div>
+                        <div class="cly-vue-tt-insights__user-meta">
+                            <span v-if="u.email" class="cly-vue-tt-insights__meta-item">{{ u.email }}</span>
+                            <span v-if="u.deviceId" class="cly-vue-tt-insights__meta-item">ID: {{ u.deviceId }}</span>
+                        </div>
+                        <div v-if="u.lastActivity" class="cly-vue-tt-insights__user-time">
+                            {{ i18n('tt-user-insights.overview.last_activity') }}: {{ formatDateTimeFull(u.lastActivity)
+                            }}
+                        </div>
+                    </div>
+
+                    <!-- Users Pagination -->
+                    <div class="bu-level bu-mt-3 bu-pt-2 cly-vue-tt-insights__pagination">
+                        <div class="bu-level-left">
+                            <small class="has-text-grey">{{ usersTotal }} {{ i18n('tt-user-insights.search.total_users')
+                                }}</small>
+                        </div>
+                        <div class="bu-level-right">
+                            <div class="bu-buttons bu-are-small">
+                                <button class="bu-button" :disabled="(state.userSearchFilter.skip || 0) <= 0"
+                                    @click="onPageUsers('prev')">
+                                    &laquo;
+                                </button>
+                                <button class="bu-button"
+                                    :disabled="(state.userSearchFilter.skip || 0) + users.length >= usersTotal"
+                                    @click="onPageUsers('next')">
+                                    &raquo;
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- RIGHT COLUMN: User Overview & Activity Timeline -->
+        <div class="bu-column bu-is-8">
+            <div v-if="!selectedUser && !userDetailsLoading" class="bu-box bu-has-text-centered bu-py-6">
+                <p class="has-text-grey">{{ i18n('tt-user-insights.state.select_user_prompt') }}</p>
+            </div>
+
+            <template v-else>
+                <!-- FUNCTIONALITY 2: USER OVERVIEW -->
+                <div v-if="selectedUser" class="bu-box cly-vue-tt-insights__overview bu-mb-4">
+                    <div class="bu-level bu-mb-3">
+                        <div class="bu-level-left">
+                            <div>
+                                <h3 class="bu-title bu-is-5 bu-mb-1">
+                                    {{ selectedUser.displayName || selectedUser.uid || selectedUser.deviceId }}
+                                </h3>
+                                <p v-if="selectedUser.email || selectedUser.username"
+                                    class="bu-subtitle bu-is-6 has-text-grey bu-mb-0">
+                                    <span v-if="selectedUser.email">{{ selectedUser.email }}</span>
+                                    <span v-if="selectedUser.email && selectedUser.username"> • </span>
+                                    <span v-if="selectedUser.username">@{{ selectedUser.username }}</span>
+                                </p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Dynamic Grid: Renders ONLY properties that are actually available on the user -->
+                    <div class="cly-vue-tt-insights__overview-grid">
+                        <div v-if="selectedUser.name || selectedUser.username || selectedUser.uid"
+                            class="cly-vue-tt-insights__stat">
+                            <span class="cly-vue-tt-insights__stat-label">{{ i18n('tt-user-insights.overview.user')
+                                }}</span>
+                            <span class="cly-vue-tt-insights__stat-value">{{ selectedUser.name || selectedUser.username
+                                || selectedUser.uid }}</span>
+                        </div>
+                        <div v-if="selectedUser.deviceId" class="cly-vue-tt-insights__stat">
+                            <span class="cly-vue-tt-insights__stat-label">{{ i18n('tt-user-insights.overview.device_id')
+                                }}</span>
+                            <span class="cly-vue-tt-insights__stat-value cly-vue-tt-insights__mono">{{
+                                selectedUser.deviceId }}</span>
+                        </div>
+                        <div v-if="selectedUser.firstSeen" class="cly-vue-tt-insights__stat">
+                            <span class="cly-vue-tt-insights__stat-label">{{
+                                i18n('tt-user-insights.overview.first_seen') }}</span>
+                            <span class="cly-vue-tt-insights__stat-value">{{ formatDateTimeFull(selectedUser.firstSeen)
+                                }}</span>
+                        </div>
+                        <div v-if="selectedUser.lastSeen" class="cly-vue-tt-insights__stat">
+                            <span class="cly-vue-tt-insights__stat-label">{{ i18n('tt-user-insights.overview.last_seen')
+                                }}</span>
+                            <span class="cly-vue-tt-insights__stat-value">{{ formatDateTimeFull(selectedUser.lastSeen)
+                                }}</span>
+                        </div>
+                        <div v-if="selectedUser.lastActivity" class="cly-vue-tt-insights__stat">
+                            <span class="cly-vue-tt-insights__stat-label">{{
+                                i18n('tt-user-insights.overview.last_activity') }}</span>
+                            <span class="cly-vue-tt-insights__stat-value">{{
+                                formatDateTimeFull(selectedUser.lastActivity) }}</span>
+                        </div>
+                        <div v-if="selectedUser.appVersion" class="cly-vue-tt-insights__stat">
+                            <span class="cly-vue-tt-insights__stat-label">{{
+                                i18n('tt-user-insights.overview.app_version') }}</span>
+                            <span class="cly-vue-tt-insights__stat-value">{{ selectedUser.appVersion }}</span>
+                        </div>
+                        <div v-if="selectedUser.osDisplay || selectedUser.os" class="cly-vue-tt-insights__stat">
+                            <span class="cly-vue-tt-insights__stat-label">{{ i18n('tt-user-insights.overview.os')
+                                }}</span>
+                            <span class="cly-vue-tt-insights__stat-value">{{ selectedUser.osDisplay || selectedUser.os
+                                }}</span>
+                        </div>
+                        <div v-if="selectedUser.device" class="cly-vue-tt-insights__stat">
+                            <span class="cly-vue-tt-insights__stat-label">{{ i18n('tt-user-insights.overview.device')
+                                }}</span>
+                            <span class="cly-vue-tt-insights__stat-value">{{ selectedUser.device }}</span>
+                        </div>
+                        <div v-if="selectedUser.country" class="cly-vue-tt-insights__stat">
+                            <span class="cly-vue-tt-insights__stat-label">{{ i18n('tt-user-insights.overview.country')
+                                }}</span>
+                            <span class="cly-vue-tt-insights__stat-value">
+                                {{ selectedUser.country }}<template v-if="selectedUser.city"> ({{ selectedUser.city
+                                    }})</template>
+                            </span>
+                        </div>
+                    </div>
+
+                    <!-- Custom User Properties (if available) -->
+                    <div v-if="hasCustomProperties" class="cly-vue-tt-insights__custom-props bu-mt-3 bu-pt-3">
+                        <h4 class="bu-is-size-7 has-text-weight-semibold has-text-grey bu-mb-2">
+                            {{ i18n('tt-user-insights.overview.custom_properties') }}
+                        </h4>
+                        <div class="bu-tags">
+                            <span v-for="(val, key) in selectedUser.customProperties" :key="key"
+                                class="bu-tag bu-is-light">
+                                <strong>{{ key }}:</strong>&nbsp;{{ val }}
+                            </span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- FUNCTIONALITY 6 & FASE 7/9: TIMELINE FILTERS & QUICK SEARCHES TOGGLE -->
+                <div class="bu-box cly-vue-tt-insights__filters bu-mb-4">
+                    <div class="bu-columns bu-is-multiline bu-is-variable bu-is-2">
+                        <!-- Period Filter -->
+                        <div class="bu-column bu-is-2">
+                            <label class="bu-label bu-is-small">{{ i18n('tt-user-insights.filter.period') }}</label>
+                            <div class="bu-select bu-is-small bu-is-fullwidth">
+                                <select v-model="periodPreset" @change="onApplyTimelineFilters">
+                                    <option value="all">{{ i18n('tt-user-insights.filter.period.all') }}</option>
+                                    <option value="24h">{{ i18n('tt-user-insights.filter.period.24h') }}</option>
+                                    <option value="7d">{{ i18n('tt-user-insights.filter.period.7d') }}</option>
+                                    <option value="30d">{{ i18n('tt-user-insights.filter.period.30d') }}</option>
+                                    <option value="90d">{{ i18n('tt-user-insights.filter.period.90d') }}</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <!-- Category Filter -->
+                        <div class="bu-column bu-is-2">
+                            <label class="bu-label bu-is-small">{{ i18n('tt-user-insights.filter.category') }}</label>
+                            <div class="bu-select bu-is-small bu-is-fullwidth">
+                                <select v-model="selectedCategory" @change="onApplyTimelineFilters">
+                                    <option value="">{{ i18n('tt-user-insights.filter.all_categories') }}</option>
+                                    <option v-for="cat in categories" :key="cat.key" :value="cat.key">
+                                        {{ cat.label }}
+                                    </option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <!-- Record Type Filter (SESSION / VIEW / TT_BUSINESS_EVENT / CUSTOM_EVENT) -->
+                        <div class="bu-column bu-is-2">
+                            <label class="bu-label bu-is-small">{{ i18n('tt-user-insights.filter.record_type') }}</label>
+                            <div class="bu-select bu-is-small bu-is-fullwidth">
+                                <select v-model="selectedEventType" @change="onApplyTimelineFilters">
+                                    <option value="">{{ i18n('tt-user-insights.filter.all_types') }}</option>
+                                    <option value="SESSION">{{ i18n('tt-user-insights.type.SESSION') }}</option>
+                                    <option value="VIEW">{{ i18n('tt-user-insights.type.VIEW') }}</option>
+                                    <option value="TT_BUSINESS_EVENT">{{ i18n('tt-user-insights.type.TT_BUSINESS_EVENT') }}</option>
+                                    <option value="CUSTOM_EVENT">{{ i18n('tt-user-insights.type.CUSTOM_EVENT') }}</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <!-- Specific Event Key Filter -->
+                        <div class="bu-column bu-is-3">
+                            <label class="bu-label bu-is-small">{{ i18n('tt-user-insights.filter.event_type') }}</label>
+                            <div class="bu-select bu-is-small bu-is-fullwidth">
+                                <select v-model="selectedEventKey" @change="onApplyTimelineFilters">
+                                    <option value="">{{ i18n('tt-user-insights.filter.all_events') }}</option>
+                                    <option v-for="def in definitions" :key="def.key" :value="def.key">
+                                        {{ def.label }}
+                                    </option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <!-- Free Text Filter -->
+                        <div class="bu-column bu-is-3">
+                            <label class="bu-label bu-is-small">{{ i18n('tt-user-insights.filter.text') }}</label>
+                            <div class="bu-field bu-has-addons">
+                                <div class="bu-control bu-is-expanded">
+                                    <input class="bu-input bu-is-small" type="text" v-model="timelineSearchText"
+                                        :placeholder="i18n('tt-user-insights.filter.text_placeholder')"
+                                        @keyup.enter="onApplyTimelineFilters" />
+                                </div>
+                                <div class="bu-control">
+                                    <button class="bu-button bu-is-small bu-is-info" @click="onApplyTimelineFilters">
+                                        {{ i18n('tt-user-insights.filter.apply') }}
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Quick Filter Bar (Fase 7: Searches / Ricerche quick filter) -->
+                    <div class="cly-vue-tt-insights__quick-filters bu-mt-2 bu-pt-2">
+                        <button class="bu-button bu-is-small"
+                            :class="searchesOnly ? 'bu-is-info' : 'bu-is-light'"
+                            @click="onToggleSearchesOnly">
+                            <span>🔍 {{ i18n('tt-user-insights.filter.searches_quick') }}</span>
+                        </button>
+                        <button
+                            v-if="selectedCategory || selectedEventType || selectedEventKey || searchesOnly || timelineSearchText || periodPreset !== 'all'"
+                            class="bu-button bu-is-small bu-is-text bu-ml-2" @click="onResetTimelineFilters">
+                            {{ i18n('tt-user-insights.filter.reset') }}
+                        </button>
+                    </div>
+                </div>
+
+                <!-- FUNCTIONALITY 3: USER ACTIVITY TIMELINE -->
+                <div class="bu-box cly-vue-tt-insights__timeline-box">
+                    <div class="bu-level bu-mb-4">
+                        <div class="bu-level-left">
+                            <h3 class="bu-title bu-is-6 bu-mb-0">{{ i18n('tt-user-insights.timeline.title') }}</h3>
+                        </div>
+                        <div class="bu-level-right">
+                            <button class="bu-button bu-is-small bu-mr-2"
+                                :class="userTimelineLive ? 'bu-is-success' : 'bu-is-light'"
+                                @click="onToggleUserTimelineLive">
+                                <span class="cly-vue-tt-insights__live-dot"
+                                    :class="{ 'is-pulsing': userTimelineLive }"></span>
+                                <span>{{ userTimelineLive ? i18n('tt-user-insights.live.user_live_on') : i18n('tt-user-insights.live.user_live_off') }}</span>
+                            </button>
+                            <span class="bu-tag bu-is-light">{{ timelineTotal }} {{
+                                i18n('tt-user-insights.timeline.events_count') }}</span>
+                        </div>
+                    </div>
+
+                    <!-- Timeline Error State -->
+                    <div v-if="timelineError" class="bu-notification bu-is-danger bu-is-light bu-p-3 bu-mb-3">
+                        {{ timelineError }}
+                    </div>
+
+                    <!-- Timeline Empty State -->
+                    <div v-if="!timelineLoading && !timeline.length"
+                        class="cly-vue-tt-insights__state bu-has-text-centered bu-py-6">
+                        <p class="has-text-grey">{{ i18n('tt-user-insights.state.no_events') }}</p>
+                        <button
+                            v-if="selectedCategory || selectedEventType || selectedEventKey || searchesOnly || timelineSearchText || periodPreset !== 'all'"
+                            class="bu-button bu-is-small bu-is-light bu-mt-3" @click="onResetTimelineFilters">
+                            {{ i18n('tt-user-insights.filter.reset') }}
+                        </button>
+                    </div>
+
+                    <!-- Timeline Feed Grouped by Reliable Sessions (Fase 8) -->
+                    <div v-else class="cly-vue-tt-insights__timeline-groups">
+                        <div v-for="group in sessionGroups" :key="group.groupKey"
+                            class="cly-vue-tt-insights__session-group"
+                            :class="{ 'is-reliable-session': group.isReliableSession }">
+
+                            <!-- Visual Session Header (Shown ONLY when Countly session association is reliable) -->
+                            <div v-if="group.isReliableSession" class="cly-vue-tt-insights__session-header">
+                                <span class="cly-vue-tt-insights__session-title">
+                                    {{ i18n('tt-user-insights.timeline.session_header') }}
+                                    {{ formatSessionDate(group.startTs) }}
+                                    {{ formatTimeShort(group.startTs) }} - {{ formatTimeShort(group.endTs) }}
+                                </span>
+                                <span v-if="group.durationFormatted" class="bu-tag bu-is-small bu-is-info bu-is-light">
+                                    {{ i18n('tt-user-insights.timeline.session_duration') }}: {{ group.durationFormatted }}
+                                </span>
+                            </div>
+
+                            <!-- Events within the Session / Group -->
+                            <div class="cly-vue-tt-insights__timeline">
+                                <div v-for="item in group.events" :key="item.id"
+                                    class="cly-vue-tt-insights__timeline-item"
+                                    :class="['is-category-' + item.category, 'is-type-' + item.type]"
+                                    @click="onOpenEventDetails(item)">
+                                    <div class="cly-vue-tt-insights__timeline-time">
+                                        <span class="cly-vue-tt-insights__time-hhmm">{{ formatTimeShort(item.timestamp)
+                                            }}</span>
+                                        <span class="cly-vue-tt-insights__time-date">{{ formatDateTimeFull(item.timestamp)
+                                            }}</span>
+                                    </div>
+
+                                    <div class="cly-vue-tt-insights__timeline-marker">
+                                        <span class="cly-vue-tt-insights__marker-dot"></span>
+                                    </div>
+
+                                    <div class="cly-vue-tt-insights__timeline-content">
+                                        <div class="cly-vue-tt-insights__timeline-header">
+                                            <span class="cly-vue-tt-insights__event-title">{{ item.title }}</span>
+                                            <div class="cly-vue-tt-insights__badges">
+                                                <!-- View / Session Duration Badge (ONLY when genuinely available) -->
+                                                <span v-if="item.durationFormatted && item.type === 'VIEW'"
+                                                    class="bu-tag bu-is-small cly-vue-tt-insights__duration-badge">
+                                                    {{ i18n('tt-user-insights.timeline.view_duration') }}: {{ item.durationFormatted }}
+                                                </span>
+                                                <span v-else-if="item.durationFormatted && item.type === 'SESSION'"
+                                                    class="bu-tag bu-is-small cly-vue-tt-insights__duration-badge">
+                                                    {{ i18n('tt-user-insights.timeline.session_duration') }}: {{ item.durationFormatted }}
+                                                </span>
+                                                <span class="bu-tag bu-is-small cly-vue-tt-insights__cat-badge">{{
+                                                    item.categoryLabel }}</span>
+                                                <span class="bu-tag bu-is-small bu-is-light cly-vue-tt-insights__key-badge">{{
+                                                    item.eventKey }}</span>
+                                            </div>
+                                        </div>
+
+                                        <!-- Primary Business Description Line -->
+                                        <p v-if="item.description" class="cly-vue-tt-insights__event-desc">
+                                            {{ item.description }}
+                                        </p>
+
+                                        <!-- Secondary Details Line -->
+                                        <p v-if="item.details" class="cly-vue-tt-insights__event-details-line">
+                                            {{ item.details }}
+                                        </p>
+
+                                        <!-- View Permanenza Line (Fase 6: shown ONLY if durationFormatted is genuinely available) -->
+                                        <p v-if="item.type === 'VIEW' && item.durationFormatted"
+                                            class="cly-vue-tt-insights__event-details-line cly-vue-tt-insights__view-permanence">
+                                            {{ i18n('tt-user-insights.timeline.view_duration') }}: {{ item.durationFormatted }}
+                                        </p>
+
+                                        <!-- Structured Business Summary Pills -->
+                                        <div v-if="item.summaryItems && item.summaryItems.length"
+                                            class="cly-vue-tt-insights__summary-pills">
+                                            <span v-for="pill in item.summaryItems" :key="pill.key"
+                                                class="cly-vue-tt-insights__pill">
+                                                <span class="cly-vue-tt-insights__pill-label">{{ pill.label }}:</span>
+                                                <strong class="cly-vue-tt-insights__pill-val">
+                                                    <template v-if="pill.format === 'currency'">€ {{ pill.formattedValue
+                                                        }}</template>
+                                                    <template v-else>{{ pill.formattedValue }}</template>
+                                                </strong>
+                                            </span>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Loading / Load More -->
+                    <div v-if="timelineLoading" class="bu-has-text-centered bu-py-4">
+                        <span>{{ i18n('tt-user-insights.state.loading_timeline') }}</span>
+                    </div>
+                    <div v-else-if="timelineHasMore" class="bu-has-text-centered bu-pt-4">
+                        <button class="bu-button bu-is-small bu-is-light" @click="onLoadMoreTimeline">
+                            {{ i18n('tt-user-insights.timeline.load_more') }}
+                        </button>
+                    </div>
+                </div>
+            </template>
+        </div>
+    </div>
+
+    <!-- ======================================================================= -->
+    <!-- MODE 2: REAL-TIME LIVE EVENTS STREAM (Priority 1 - PostHog Inspired)   -->
+    <!-- ======================================================================= -->
+    <div v-else class="cly-vue-tt-insights__live-container">
+        <!-- Live Stream Control & Filter Bar -->
+        <div class="bu-box cly-vue-tt-insights__filters bu-mb-4">
+            <div class="bu-level bu-mb-3">
+                <div class="bu-level-left">
+                    <div class="cly-vue-tt-insights__live-status">
+                        <span class="cly-vue-tt-insights__live-dot"
+                            :class="{ 'is-pulsing': !liveStreamPaused, 'is-paused': liveStreamPaused }"></span>
+                        <strong v-if="!liveStreamPaused">{{ i18n('tt-user-insights.live.status_running') }}</strong>
+                        <strong v-else class="has-text-grey">{{ i18n('tt-user-insights.live.status_paused') }}</strong>
+                    </div>
+                </div>
+                <div class="bu-level-right">
+                    <div class="bu-buttons bu-are-small">
+                        <button class="bu-button"
+                            :class="liveStreamPaused ? 'bu-is-success' : 'bu-is-warning'"
+                            @click="onToggleLiveStreamPause">
+                            <span v-if="liveStreamPaused">▶️ {{ i18n('tt-user-insights.live.resume') }}</span>
+                            <span v-else>⏸️ {{ i18n('tt-user-insights.live.pause') }}</span>
+                        </button>
+                        <button class="bu-button bu-is-light" @click="onApplyLiveFilters">
+                            🔄 {{ i18n('tt-user-insights.live.refresh_now') }}
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="bu-columns bu-is-multiline bu-is-variable bu-is-2">
+                <!-- Category Filter -->
+                <div class="bu-column bu-is-3">
+                    <label class="bu-label bu-is-small">{{ i18n('tt-user-insights.filter.category') }}</label>
+                    <div class="bu-select bu-is-small bu-is-fullwidth">
+                        <select v-model="liveCategory" @change="onApplyLiveFilters">
+                            <option value="">{{ i18n('tt-user-insights.filter.all_categories') }}</option>
+                            <option v-for="cat in categories" :key="cat.key" :value="cat.key">
+                                {{ cat.label }}
+                            </option>
+                        </select>
+                    </div>
+                </div>
+
+                <!-- Record Type Filter -->
+                <div class="bu-column bu-is-3">
+                    <label class="bu-label bu-is-small">{{ i18n('tt-user-insights.filter.record_type') }}</label>
+                    <div class="bu-select bu-is-small bu-is-fullwidth">
+                        <select v-model="liveEventType" @change="onApplyLiveFilters">
+                            <option value="">{{ i18n('tt-user-insights.filter.all_types') }}</option>
+                            <option value="SESSION">{{ i18n('tt-user-insights.type.SESSION') }}</option>
+                            <option value="VIEW">{{ i18n('tt-user-insights.type.VIEW') }}</option>
+                            <option value="TT_BUSINESS_EVENT">{{ i18n('tt-user-insights.type.TT_BUSINESS_EVENT') }}</option>
+                            <option value="CUSTOM_EVENT">{{ i18n('tt-user-insights.type.CUSTOM_EVENT') }}</option>
+                        </select>
+                    </div>
+                </div>
+
+                <!-- Specific Event Key Filter -->
+                <div class="bu-column bu-is-3">
+                    <label class="bu-label bu-is-small">{{ i18n('tt-user-insights.filter.event_type') }}</label>
+                    <div class="bu-select bu-is-small bu-is-fullwidth">
+                        <select v-model="liveEventKey" @change="onApplyLiveFilters">
+                            <option value="">{{ i18n('tt-user-insights.filter.all_events') }}</option>
+                            <option v-for="def in definitions" :key="def.key" :value="def.key">
+                                {{ def.label }}
+                            </option>
+                        </select>
+                    </div>
+                </div>
+
+                <!-- Free Text Filter -->
+                <div class="bu-column bu-is-3">
+                    <label class="bu-label bu-is-small">{{ i18n('tt-user-insights.filter.text') }}</label>
+                    <div class="bu-field bu-has-addons">
+                        <div class="bu-control bu-is-expanded">
+                            <input class="bu-input bu-is-small" type="text" v-model="liveSearchText"
+                                :placeholder="i18n('tt-user-insights.filter.text_placeholder')"
+                                @keyup.enter="onApplyLiveFilters" />
+                        </div>
+                        <div class="bu-control">
+                            <button class="bu-button bu-is-small bu-is-info" @click="onApplyLiveFilters">
+                                {{ i18n('tt-user-insights.filter.apply') }}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Quick Filters for Live Stream: Errors Only & Searches Only -->
+            <div class="cly-vue-tt-insights__quick-filters bu-mt-2 bu-pt-2">
+                <button class="bu-button bu-is-small bu-mr-2"
+                    :class="liveErrorsOnly ? 'bu-is-danger' : 'bu-is-light'"
+                    @click="onToggleLiveErrorsOnly">
+                    <span>🚨 {{ i18n('tt-user-insights.live.errors_only') }}</span>
+                </button>
+                <button class="bu-button bu-is-small"
+                    :class="liveSearchesOnly ? 'bu-is-info' : 'bu-is-light'"
+                    @click="onToggleLiveSearchesOnly">
+                    <span>🔍 {{ i18n('tt-user-insights.filter.searches_quick') }}</span>
+                </button>
+                <button
+                    v-if="liveCategory || liveEventType || liveEventKey || liveErrorsOnly || liveSearchesOnly || liveSearchText"
+                    class="bu-button bu-is-small bu-is-text bu-ml-2" @click="onResetLiveFilters">
+                    {{ i18n('tt-user-insights.filter.reset') }}
+                </button>
+            </div>
+        </div>
+
+        <!-- Live Stream Feed Box -->
+        <div class="bu-box cly-vue-tt-insights__timeline-box">
+            <div class="bu-level bu-mb-4">
+                <div class="bu-level-left">
+                    <h3 class="bu-title bu-is-6 bu-mb-0">{{ i18n('tt-user-insights.live.feed_title') }}</h3>
+                </div>
+                <div class="bu-level-right">
+                    <span class="bu-tag bu-is-light">{{ liveStream.length }} / {{ liveStreamTotal }} {{
+                        i18n('tt-user-insights.timeline.events_count') }}</span>
+                </div>
+            </div>
+
+            <div v-if="liveStreamError" class="bu-notification bu-is-danger bu-is-light bu-p-3 bu-mb-3">
+                {{ liveStreamError }}
+            </div>
+
+            <div v-if="liveStreamLoading && !liveStream.length" class="bu-has-text-centered bu-py-6">
+                <span>{{ i18n('tt-user-insights.state.loading_timeline') }}</span>
+            </div>
+
+            <div v-else-if="!liveStream.length" class="cly-vue-tt-insights__state bu-has-text-centered bu-py-6">
+                <p class="has-text-grey">{{ i18n('tt-user-insights.state.no_events') }}</p>
+            </div>
+
+            <div v-else class="cly-vue-tt-insights__timeline">
+                <div v-for="item in liveStream" :key="item.id"
+                    class="cly-vue-tt-insights__timeline-item cly-vue-tt-insights__live-row"
+                    :class="['is-category-' + item.category, 'is-type-' + item.type]"
+                    @click="onOpenEventDetails(item)">
+                    <div class="cly-vue-tt-insights__timeline-time">
+                        <span class="cly-vue-tt-insights__time-hhmm">{{ formatTimeWithSeconds(item.timestamp) }}</span>
+                        <span class="cly-vue-tt-insights__time-date">{{ formatSessionDate(item.timestamp) }}</span>
+                    </div>
+
+                    <div class="cly-vue-tt-insights__timeline-marker">
+                        <span class="cly-vue-tt-insights__marker-dot"></span>
+                    </div>
+
+                    <div class="cly-vue-tt-insights__timeline-content">
+                        <div class="cly-vue-tt-insights__timeline-header">
+                            <div>
+                                <!-- Clickable User Badge to jump straight to that user's timeline -->
+                                <span v-if="item.user"
+                                    class="bu-tag bu-is-small cly-vue-tt-insights__user-jump-badge bu-mr-2"
+                                    :title="i18n('tt-user-insights.live.inspect_user_tooltip')"
+                                    @click="onInspectUserFromLive(item.user, $event)">
+                                    👤 {{ item.user.displayName || item.user.deviceId || item.user.uid }}
+                                </span>
+                                <span class="cly-vue-tt-insights__event-title">{{ item.title }}</span>
+                            </div>
+
+                            <div class="cly-vue-tt-insights__badges">
+                                <span v-if="item.durationFormatted && item.type === 'VIEW'"
+                                    class="bu-tag bu-is-small cly-vue-tt-insights__duration-badge">
+                                    {{ i18n('tt-user-insights.timeline.view_duration') }}: {{ item.durationFormatted }}
+                                </span>
+                                <span class="bu-tag bu-is-small cly-vue-tt-insights__cat-badge">{{ item.categoryLabel }}</span>
+                                <span class="bu-tag bu-is-small bu-is-light cly-vue-tt-insights__key-badge">{{ item.eventKey }}</span>
+                            </div>
+                        </div>
+
+                        <p v-if="item.description" class="cly-vue-tt-insights__event-desc">
+                            {{ item.description }}
+                        </p>
+                        <p v-if="item.details" class="cly-vue-tt-insights__event-details-line">
+                            {{ item.details }}
+                        </p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ======================================================================= -->
+    <!-- EVENT DETAILS & ERROR BREADCRUMBS DRAWER (Business / Breadcrumbs / Raw) -->
+    <!-- ======================================================================= -->
+    <div v-if="selectedEvent" class="cly-vue-tt-insights__drawer-backdrop" @click.self="onCloseEventDetails">
+        <div class="cly-vue-tt-insights__drawer bu-box">
+            <div class="bu-level bu-mb-3">
+                <div class="bu-level-left">
+                    <div>
+                        <h3 class="bu-title bu-is-5 bu-mb-1">{{ selectedEvent.title }}</h3>
+                        <span class="bu-tag bu-is-info bu-is-light cly-vue-tt-insights__mono">{{ selectedEvent.eventKey
+                            }}</span>
+                        <span class="bu-tag bu-is-light bu-ml-1">{{ selectedEvent.type }}</span>
+                    </div>
+                </div>
+                <div class="bu-level-right">
+                    <button class="bu-delete bu-is-medium" @click="onCloseEventDetails"></button>
+                </div>
+            </div>
+
+            <!-- 3 Tabs: Business View | Breadcrumbs (Passi Precedenti) | Raw Event Data -->
+            <div class="bu-tabs bu-is-boxed bu-is-small bu-mb-4">
+                <ul>
+                    <li :class="{ 'bu-is-active': activeDetailsTab === 'business' }">
+                        <a @click="onSwitchDetailsTab('business')">{{ i18n('tt-user-insights.details.tab_business')
+                            }}</a>
+                    </li>
+                    <li :class="{ 'bu-is-active': activeDetailsTab === 'breadcrumbs' }">
+                        <a @click="onSwitchDetailsTab('breadcrumbs')">
+                            🧭 {{ i18n('tt-user-insights.details.tab_breadcrumbs') }}
+                            <span class="bu-tag bu-is-rounded bu-is-small bu-ml-1"
+                                :class="selectedEvent.category === 'error' ? 'bu-is-danger' : 'bu-is-light'">
+                                {{ breadcrumbs.length }}
+                            </span>
+                        </a>
+                    </li>
+                    <li :class="{ 'bu-is-active': activeDetailsTab === 'raw' }">
+                        <a @click="onSwitchDetailsTab('raw')">{{ i18n('tt-user-insights.details.tab_raw') }}</a>
+                    </li>
+                </ul>
+            </div>
+
+            <!-- TAB 1: BUSINESS VIEW -->
+            <div v-if="activeDetailsTab === 'business'" class="cly-vue-tt-insights__details-body">
+                <div class="cly-vue-tt-insights__overview-grid bu-mb-4">
+                    <div class="cly-vue-tt-insights__stat">
+                        <span class="cly-vue-tt-insights__stat-label">{{ i18n('tt-user-insights.details.event_key')
+                            }}</span>
+                        <span class="cly-vue-tt-insights__stat-value cly-vue-tt-insights__mono">{{
+                            selectedEvent.eventKey }}</span>
+                    </div>
+                    <div class="cly-vue-tt-insights__stat">
+                        <span class="cly-vue-tt-insights__stat-label">{{ i18n('tt-user-insights.details.timestamp')
+                            }}</span>
+                        <span class="cly-vue-tt-insights__stat-value">{{ formatDateTimeFull(selectedEvent.timestamp)
+                            }}</span>
+                    </div>
+                    <div class="cly-vue-tt-insights__stat">
+                        <span class="cly-vue-tt-insights__stat-label">{{ i18n('tt-user-insights.details.category')
+                            }}</span>
+                        <span class="cly-vue-tt-insights__stat-value">{{ selectedEvent.categoryLabel }} ({{
+                            selectedEvent.type }})</span>
+                    </div>
+                    <div v-if="selectedEvent.durationFormatted" class="cly-vue-tt-insights__stat">
+                        <span class="cly-vue-tt-insights__stat-label">{{ i18n('tt-user-insights.timeline.view_duration')
+                            }}</span>
+                        <span class="cly-vue-tt-insights__stat-value">{{ selectedEvent.durationFormatted }}</span>
+                    </div>
+                    <div v-if="selectedEvent.session && selectedEvent.session.sessionId" class="cly-vue-tt-insights__stat">
+                        <span class="cly-vue-tt-insights__stat-label">{{ i18n('tt-user-insights.details.session_id')
+                            }}</span>
+                        <span class="cly-vue-tt-insights__stat-value cly-vue-tt-insights__mono">{{
+                            selectedEvent.session.sessionId }}</span>
+                    </div>
+                    <div class="cly-vue-tt-insights__stat">
+                        <span class="cly-vue-tt-insights__stat-label">{{ i18n('tt-user-insights.details.user_device')
+                            }}</span>
+                        <span class="cly-vue-tt-insights__stat-value cly-vue-tt-insights__mono">
+                            {{ (selectedEvent.user && (selectedEvent.user.displayName || selectedEvent.user.deviceId || selectedEvent.user.uid)) || '-' }}
+                        </span>
+                    </div>
+                </div>
+
+                <div v-if="selectedEvent.description || selectedEvent.details"
+                    class="bu-notification bu-is-light bu-p-3 bu-mb-4">
+                    <div v-if="selectedEvent.description">
+                        <strong>{{ i18n('tt-user-insights.details.summary') }}:</strong> {{ selectedEvent.description }}
+                    </div>
+                    <div v-if="selectedEvent.details" class="bu-mt-1 has-text-grey">
+                        {{ selectedEvent.details }}
+                    </div>
+                </div>
+
+                <h4 class="bu-title bu-is-6 bu-mb-2">{{ i18n('tt-user-insights.details.segments') }}</h4>
+                <table v-if="hasEventSegments" class="bu-table bu-is-fullwidth bu-is-striped bu-is-narrow">
+                    <thead>
+                        <tr>
+                            <th>{{ i18n('tt-user-insights.details.property') }}</th>
+                            <th>{{ i18n('tt-user-insights.details.value') }}</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr v-for="(val, key) in selectedEvent.eventData.segments" :key="key">
+                            <td class="cly-vue-tt-insights__mono">{{ key }}</td>
+                            <td>{{ val }}</td>
+                        </tr>
+                    </tbody>
+                </table>
+                <p v-else class="has-text-grey bu-is-size-7">
+                    {{ i18n('tt-user-insights.details.no_segments') }}
+                </p>
+            </div>
+
+            <!-- TAB 2: ERROR & EVENT BREADCRUMBS (Preceding User Actions) -->
+            <div v-else-if="activeDetailsTab === 'breadcrumbs'" class="cly-vue-tt-insights__details-breadcrumbs">
+                <p class="bu-is-size-7 has-text-grey bu-mb-3">
+                    {{ i18n('tt-user-insights.details.breadcrumbs_notice') }}
+                </p>
+
+                <div v-if="breadcrumbsLoading" class="bu-has-text-centered bu-py-4">
+                    <span>{{ i18n('tt-user-insights.state.loading_timeline') }}</span>
+                </div>
+
+                <div v-else-if="!breadcrumbs.length" class="bu-notification bu-is-light bu-p-3">
+                    {{ i18n('tt-user-insights.details.no_breadcrumbs') }}
+                </div>
+
+                <div v-else class="cly-vue-tt-insights__breadcrumbs-list">
+                    <div v-for="(bc, idx) in breadcrumbs" :key="bc.id"
+                        class="cly-vue-tt-insights__breadcrumb-step"
+                        :class="'is-category-' + bc.category">
+                        <div class="cly-vue-tt-insights__breadcrumb-meta">
+                            <span class="bu-tag bu-is-small bu-is-light cly-vue-tt-insights__mono">
+                                #{{ idx + 1 }} ({{ bc.relativeTimeBefore }})
+                            </span>
+                            <span class="cly-vue-tt-insights__time-date">{{ formatTimeWithSeconds(bc.timestamp) }}</span>
+                        </div>
+                        <div class="cly-vue-tt-insights__breadcrumb-body">
+                            <strong>{{ bc.title }}</strong>
+                            <span class="bu-tag bu-is-small bu-is-white cly-vue-tt-insights__mono">{{ bc.eventKey }}</span>
+                            <div v-if="bc.description" class="cly-vue-tt-insights__event-desc bu-mb-0">{{ bc.description }}</div>
+                            <div v-if="bc.details" class="cly-vue-tt-insights__event-details-line bu-mb-0">{{ bc.details }}</div>
+                        </div>
+                    </div>
+
+                    <!-- Final Target Event (T = 0s) -->
+                    <div class="cly-vue-tt-insights__breadcrumb-step is-target-event"
+                        :class="'is-category-' + selectedEvent.category">
+                        <div class="cly-vue-tt-insights__breadcrumb-meta">
+                            <span class="bu-tag bu-is-small bu-is-info cly-vue-tt-insights__mono">
+                                🎯 T = 0s
+                            </span>
+                            <span class="cly-vue-tt-insights__time-date">{{ formatTimeWithSeconds(selectedEvent.timestamp) }}</span>
+                        </div>
+                        <div class="cly-vue-tt-insights__breadcrumb-body">
+                            <strong>{{ selectedEvent.title }}</strong>
+                            <span class="bu-tag bu-is-small bu-is-light cly-vue-tt-insights__mono">{{ selectedEvent.eventKey }}</span>
+                            <div v-if="selectedEvent.description" class="cly-vue-tt-insights__event-desc bu-mb-0">{{ selectedEvent.description }}</div>
+                            <div v-if="selectedEvent.details" class="cly-vue-tt-insights__event-details-line bu-mb-0">{{ selectedEvent.details }}</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- TAB 3: SEPARATED RAW EVENT DATA VIEW -->
+            <div v-else class="cly-vue-tt-insights__details-raw">
+                <p class="bu-is-size-7 has-text-grey bu-mb-2">
+                    {{ i18n('tt-user-insights.details.raw_notice') }}
+                </p>
+                <pre class="cly-vue-tt-insights__raw-pre"><code>{{ formattedRawEventJson }}</code></pre>
+            </div>
+        </div>
+    </div>
+</div>

@@ -1,0 +1,951 @@
+var request = require('supertest');
+var should = require('should');
+var testUtils = require("../../test/testUtils");
+request = request(testUtils.url);
+
+var API_KEY_ADMIN = "";
+var APP_ID = "";
+var APP_KEY = "";
+var DEVICE_ID = "123456789";
+var WIDGET_ID = "";
+
+/**
+ * Pull out every locally-referenced asset path (href/src attributes and
+ * CSS url(...) references) from a rendered feedback-popup page, ignoring
+ * absolute URLs like the "https://count.ly" footer link.
+ * @param {string} html - rendered feedback-popup HTML
+ * @returns {Array} list of path strings found in the markup
+ */
+function extractLocalAssetPaths(html) {
+    var paths = [];
+    var attrRe = /(?:href|src)\s*=\s*["']([^"']+)["']/g;
+    var urlRe = /url\(\s*['"]?([^'")]+)['"]?\s*\)/g;
+    var m;
+    while ((m = attrRe.exec(html)) !== null) {
+        if (m[1].startsWith('/')) {
+            paths.push(m[1]);
+        }
+    }
+    while ((m = urlRe.exec(html)) !== null) {
+        if (m[1].startsWith('/')) {
+            paths.push(m[1]);
+        }
+    }
+    return paths;
+}
+
+describe('Testing Rating plugin', function() {
+
+    describe('Feedback popup asset paths with provided_url', function() {
+        it('should prefix asset paths with countlyConfig.path when provided_url is not passed', function(done) {
+            request.get('/feedback/rating')
+                .expect(200)
+                .end(function(err, res) {
+                    if (err) {
+                        return done(err);
+                    }
+                    var paths = extractLocalAssetPaths(res.text);
+                    paths.length.should.be.above(15);
+                    paths.forEach(function(p) {
+                        p.should.startWith('/');
+                        p.should.not.startWith('//');
+                    });
+                    var dataAttr = res.text.match(/data-countly-path="([^"]*)"/);
+                    should.exist(dataAttr);
+                    dataAttr[1].should.eql('');
+                    done();
+                });
+        });
+
+        it('should not send the framing or opener headers, so the widget stays embeddable', function(done) {
+            request.get('/feedback/rating')
+                .expect(200)
+                .end(function(err, res) {
+                    if (err) {
+                        return done(err);
+                    }
+                    //the widget is embedded by an SDK into a page on the customer's own
+                    //origin, so neither header the dashboard sets globally may survive here
+                    should.not.exist(res.headers['x-frame-options']);
+                    should.not.exist(res.headers['cross-origin-opener-policy']);
+                    done();
+                });
+        });
+
+        it('should prefix every asset path with provided_url when it has a leading slash', function(done) {
+            var providedUrl = '/reverse-proxy/countly';
+            request.get('/feedback/rating?provided_url=' + encodeURIComponent(providedUrl))
+                .expect(200)
+                .end(function(err, res) {
+                    if (err) {
+                        return done(err);
+                    }
+                    var paths = extractLocalAssetPaths(res.text);
+                    paths.length.should.be.above(15);
+                    paths.forEach(function(p) {
+                        p.should.startWith(providedUrl + '/');
+                    });
+                    var dataAttr = res.text.match(/data-countly-path="([^"]*)"/);
+                    should.exist(dataAttr);
+                    dataAttr[1].should.eql(providedUrl);
+                    done();
+                });
+        });
+
+        it('should add a leading slash to provided_url when missing and still prefix every asset path', function(done) {
+            var providedUrl = 'reverse-proxy/countly';
+            request.get('/feedback/rating?provided_url=' + encodeURIComponent(providedUrl))
+                .expect(200)
+                .end(function(err, res) {
+                    if (err) {
+                        return done(err);
+                    }
+                    var paths = extractLocalAssetPaths(res.text);
+                    paths.length.should.be.above(15);
+                    paths.forEach(function(p) {
+                        p.should.startWith('/' + providedUrl + '/');
+                    });
+                    var dataAttr = res.text.match(/data-countly-path="([^"]*)"/);
+                    should.exist(dataAttr);
+                    dataAttr[1].should.eql('/' + providedUrl);
+                    done();
+                });
+        });
+    });
+
+    describe('Get empty widget list', function() {
+        it('should return 200 and empty widget list', function(done) {
+            API_KEY_ADMIN = testUtils.get("API_KEY_ADMIN");
+            APP_ID = testUtils.get("APP_ID");
+            request.get('/o/feedback/widgets?app_id=' + APP_ID + '&api_key=' + API_KEY_ADMIN)
+                .expect(200)
+                .end(function(err, res) {
+                    if (err) {
+                        return done(err);
+                    }
+                    var ob = JSON.parse(res.text);
+                    ob.length.should.eql(0);
+                    done();
+                });
+        });
+    });
+
+    describe('Try to get single widget which not exist', function() {
+        it('should return single widget', function(done) {
+            API_KEY_ADMIN = testUtils.get("API_KEY_ADMIN");
+            APP_ID = testUtils.get("APP_ID");
+            request.get('/o/feedback/widget?app_id=' + APP_ID + '&api_key=' + API_KEY_ADMIN + '&widget_id=1')
+                .expect(404)
+                .end(function(err, res) {
+                    if (err) {
+                        return done(err);
+                    }
+                    var ob = JSON.parse(res.text);
+                    ob.should.have.property('result', 'Widget not found.');
+                    done();
+                });
+        });
+    });
+
+    describe('Try to get widgets with empty array parameter', function() {
+        it('should return empty array', function(done) {
+            API_KEY_ADMIN = testUtils.get('API_KEY_ADMIN');
+            APP_ID = testUtils.get("APP_ID");
+            WIDGET_ID = testUtils.get('WIDGET_ID');
+            var array4query = [WIDGET_ID];
+            request.get('/o/feedback/multiple-widgets-by-id?app_id=' + APP_ID + '&api_key=' + API_KEY_ADMIN + '&widgets=[]')
+                .expect(200)
+                .end(function(err, res) {
+                    if (err) {
+                        return done(err);
+                    }
+                    var ob = JSON.parse(res.text);
+                    ob.length.should.eql(0);
+                    done();
+                });
+        });
+    });
+
+    describe('Try to get feedback data', function() {
+        it('should return 200 and empty object', function(done) {
+            APP_ID = testUtils.get("APP_ID") || APP_ID;
+            var data;
+            request.get('/o?method=star&period=60days&api_key=' + API_KEY_ADMIN + '&app_id=' + APP_ID)
+                .expect(200)
+                .end(function(err, res) {
+                    var ob = JSON.parse(res.text);
+                    ob.should.eql({});
+                    done();
+                });
+        });
+    });
+
+    describe('Creating widget', function() {
+        it('should success', function(done) {
+            API_KEY_ADMIN = testUtils.get("API_KEY_ADMIN");
+            APP_ID = testUtils.get("APP_ID");
+            request.get('/i/feedback/widgets/create?api_key=' + API_KEY_ADMIN + '&app_id=' + APP_ID + '&popup_header_text=Widget which generated by test&popup_comment_callout=Leave comment&popup_email_callout=Leave email&popup_button_callout=Submit&popup_thanks_message=Thanks for feedback&trigger_position=mleft&trigger_bg_color=#123456&trigger_font_color=#122333&trigger_button_text=Leave feedback&target_devices={desktop:false,phone:true,tablet:true}&target_page=selected&target_pages=["/"]&is_active=true&hide_sticker=false')
+                .expect(201)
+                .end(function(err, res) {
+                    if (err) {
+                        return done(err);
+                    }
+                    var ob = JSON.parse(res.text);
+                    ob.result.should.match(/^Successfully created [0-9a-f]{24}$/);
+                    setTimeout(done, 10 * testUtils.testScalingFactor);
+                });
+        });
+    });
+
+    describe('Get widget list', function() {
+        it('should return 200 and widget list', function(done) {
+            API_KEY_ADMIN = testUtils.get("API_KEY_ADMIN");
+            APP_ID = testUtils.get("APP_ID");
+            request.get('/o/feedback/widgets?app_id=' + APP_ID + '&api_key=' + API_KEY_ADMIN)
+                .expect(200)
+                .end(function(err, res) {
+                    if (err) {
+                        return done(err);
+                    }
+                    var ob = JSON.parse(res.text);
+                    testUtils.set('WIDGET_ID', ob[0]._id);
+                    ob.length.should.above(0);
+                    done();
+                });
+        });
+    });
+
+    describe('Get single widget', function() {
+        it('should return single widget', function(done) {
+            API_KEY_ADMIN = testUtils.get("API_KEY_ADMIN");
+            APP_ID = testUtils.get("APP_ID");
+            WIDGET_ID = testUtils.get("WIDGET_ID");
+            request.get('/o/feedback/widget?app_id=' + APP_ID + '&api_key=' + API_KEY_ADMIN + '&widget_id=' + WIDGET_ID)
+                .expect(200)
+                .end(function(err, res) {
+                    if (err) {
+                        return done(err);
+                    }
+                    done();
+                });
+        });
+    });
+
+    describe('Widget details read', function() {
+        var targeting = {steps: [], user_segmentation: {query: {"up.cc": {"$in": ["LV"]}}, queryText: ""}};
+
+        before(async function() {
+            WIDGET_ID = testUtils.get("WIDGET_ID");
+            //create stores targeting only when cohorts are enabled, so set it directly
+            await testUtils.db.collection("feedback_widgets").updateOne({_id: testUtils.db.ObjectID(WIDGET_ID)}, {$set: {targeting: targeting, cohortID: "test-cohort"}});
+        });
+
+        it('returns targeting and cohortID from the authenticated list filtered by widget_id', function(done) {
+            request.get('/o/feedback/widgets?app_id=' + APP_ID + '&api_key=' + API_KEY_ADMIN + '&widget_id=' + WIDGET_ID)
+                .expect(200)
+                .end(function(err, res) {
+                    if (err) {
+                        return done(err);
+                    }
+                    var ob = JSON.parse(res.text);
+                    ob.length.should.eql(1);
+                    ob[0]._id.should.eql(WIDGET_ID);
+                    ob[0].should.have.property('targeting', targeting);
+                    ob[0].should.have.property('cohortID', 'test-cohort');
+                    done();
+                });
+        });
+
+        it('does not return targeting or cohortID from the anonymous single widget read', function(done) {
+            request.get('/o/feedback/widget?widget_id=' + WIDGET_ID)
+                .expect(200)
+                .end(function(err, res) {
+                    if (err) {
+                        return done(err);
+                    }
+                    var ob = JSON.parse(res.text);
+                    ob._id.should.eql(WIDGET_ID);
+                    ob.should.not.have.property('targeting');
+                    ob.should.not.have.property('cohortID');
+                    done();
+                });
+        });
+
+        it('returns an empty list for an unknown widget_id', function(done) {
+            request.get('/o/feedback/widgets?app_id=' + APP_ID + '&api_key=' + API_KEY_ADMIN + '&widget_id=1')
+                .expect(200)
+                .end(function(err, res) {
+                    if (err) {
+                        return done(err);
+                    }
+                    JSON.parse(res.text).should.eql([]);
+                    done();
+                });
+        });
+
+        it('requires authentication', function(done) {
+            request.get('/o/feedback/widgets?app_id=' + APP_ID + '&widget_id=' + WIDGET_ID)
+                .expect(400)
+                .end(done);
+        });
+
+        after(async function() {
+            await testUtils.db.collection("feedback_widgets").updateOne({_id: testUtils.db.ObjectID(WIDGET_ID)}, {$unset: {targeting: "", cohortID: ""}});
+        });
+    });
+
+    describe('Widget show counter', function() {
+        //the popup page fetches the widget with nfd=1 and no credential; only the
+        //owning app's key may count the show, and the widget is returned either way.
+        //A show is written after the response, in request order, so each case that must
+        //not count is followed by one that must: once that show is visible, a show
+        //wrongly counted before it is visible too, and the exact total catches it.
+        var otherAppId = "";
+        var otherAppKey = "";
+        var shownBefore = 0;
+        var scale = testUtils.testScalingFactor || 1;
+
+        function timesShown() {
+            return testUtils.db.collection('feedback_widgets').findOne({_id: testUtils.db.ObjectID(WIDGET_ID)}, {projection: {timesShown: 1}}).then(function(w) {
+                return (w && w.timesShown) || 0;
+            });
+        }
+
+        function wait(ms) {
+            return new Promise(function(resolve) {
+                setTimeout(resolve, ms);
+            });
+        }
+
+        function fetchForSdk(query) {
+            return request.get('/o/feedback/widget?widget_id=' + WIDGET_ID + '&nfd=1' + query)
+                .expect(200)
+                .then(function(res) {
+                    JSON.parse(res.text).should.have.property('_id', WIDGET_ID);
+                });
+        }
+
+        async function expectTimesShown(expected) {
+            var started = Date.now();
+            var n = await timesShown();
+            while (n < expected && Date.now() - started < 20000 * scale) {
+                await wait(250 * scale);
+                n = await timesShown();
+            }
+            (await timesShown()).should.eql(expected);
+        }
+
+        before(async function() {
+            API_KEY_ADMIN = testUtils.get("API_KEY_ADMIN");
+            APP_KEY = testUtils.get("APP_KEY");
+            WIDGET_ID = testUtils.get("WIDGET_ID");
+            var res = await request.get('/i/apps/create?api_key=' + API_KEY_ADMIN + '&args=' + encodeURIComponent(JSON.stringify({name: "SRShowCounterOtherApp", type: "mobile"})))
+                .expect(200);
+            otherAppId = res.body._id;
+            otherAppKey = res.body.key;
+            should.exist(otherAppKey);
+            shownBefore = await timesShown();
+        });
+
+        it('returns the widget without counting a show when no app key is sent', async function() {
+            await fetchForSdk('');
+            await fetchForSdk('&app_key=' + APP_KEY);
+            await expectTimesShown(shownBefore + 1);
+        });
+
+        it('returns the widget without counting a show for another app\'s key', async function() {
+            await fetchForSdk('&app_key=' + otherAppKey);
+            await fetchForSdk('&app_key=' + APP_KEY);
+            await expectTimesShown(shownBefore + 2);
+        });
+
+        it('returns the widget and counts one show for the owning app\'s key', async function() {
+            await fetchForSdk('&app_key=' + APP_KEY);
+            await expectTimesShown(shownBefore + 3);
+        });
+
+        after(async function() {
+            if (otherAppId) {
+                await request.get('/i/apps/delete?api_key=' + API_KEY_ADMIN + '&args=' + encodeURIComponent(JSON.stringify({app_id: otherAppId})));
+            }
+        });
+    });
+
+    describe('Get widgets by array parameter', function() {
+        it('should return widgets array', function(done) {
+            API_KEY_ADMIN = testUtils.get('API_KEY_ADMIN');
+            APP_ID = testUtils.get("APP_ID");
+            WIDGET_ID = testUtils.get('WIDGET_ID');
+            var array4query = [WIDGET_ID];
+            request.get('/o/feedback/multiple-widgets-by-id?app_id=' + APP_ID + '&api_key=' + API_KEY_ADMIN + '&widgets=' + JSON.stringify(array4query))
+                .expect(200)
+                .end(function(err, res) {
+                    if (err) {
+                        return done(err);
+                    }
+                    var ob = JSON.parse(res.text);
+                    ob.length.should.eql(1);
+                    done();
+                });
+        });
+    });
+
+    describe('Editing widget', function() {
+        it('should success', function(done) {
+            API_KEY_ADMIN = testUtils.get("API_KEY_ADMIN");
+            APP_ID = testUtils.get("APP_ID");
+            WIDGET_ID = testUtils.get('WIDGET_ID');
+            request.get('/i/feedback/widgets/edit?api_key=' + API_KEY_ADMIN + '&app_id=' + APP_ID + '&widget_id=' + WIDGET_ID + '&popup_header_text=Widget which edited by test&popup_comment_callout=Leave to us a comment&popup_email_callout=Contact me by email&popup_button_callout=Submit Feedback&popup_thanks_message=Thank you for great feedback!&trigger_position=mright&trigger_bg_color=#345678&trigger_font_color=#111222&trigger_button_text=Feedback Trigger Text&target_devices={desktop:true,phone:true,tablet:true}&target_page=selected&target_pages=["/home"]&is_active=false&hide_sticker=false')
+                .expect(200)
+                .end(function(err, res) {
+                    if (err) {
+                        return done(err);
+                    }
+                    var ob = JSON.parse(res.text);
+                    ob.should.have.property('result', 'Success');
+                    setTimeout(done, 10 * testUtils.testScalingFactor);
+                });
+        });
+    });
+
+    describe('Get edited widget', function() {
+        it('should return widget with new values', function(done) {
+            API_KEY_ADMIN = testUtils.get("API_KEY_ADMIN");
+            APP_ID = testUtils.get("APP_ID");
+            WIDGET_ID = testUtils.get("WIDGET_ID");
+            request.get('/o/feedback/widget?app_id=' + APP_ID + '&api_key=' + API_KEY_ADMIN + '&widget_id=' + WIDGET_ID)
+                .expect(200)
+                .end(function(err, res) {
+                    if (err) {
+                        return done(err);
+                    }
+                    var ob = JSON.parse(res.text);
+                    ob.should.have.property('popup_header_text', 'Widget which edited by test');
+                    done();
+                });
+        });
+    });
+
+    describe('Creating feedback event with widget_id', function() {
+        it('should success', function(done) {
+            API_KEY_ADMIN = testUtils.get("API_KEY_ADMIN");
+            APP_ID = testUtils.get("APP_ID");
+            APP_KEY = testUtils.get("APP_KEY");
+            WIDGET_ID = testUtils.get("WIDGET_ID");
+
+            var events = [{
+                "key": "[CLY]_star_rating",
+                "count": 1,
+                "sum": 1,
+                "segmentation": {
+                    "contactMe": true,
+                    "email": "someone@gmail.com",
+                    "comment": "It's a test comment.",
+                    "rating": 5,
+                    "app_version": "1.23",
+                    "platform": "iOS",
+                    "widget_id": WIDGET_ID
+                }
+            }];
+
+            request.get('/i?app_key=' + APP_KEY + '&device_id=' + 1 + "&events=" + JSON.stringify(events))
+                .expect(200)
+                .end(function(err, res) {
+                    if (err) {
+                        return done(err);
+                    }
+                    var ob = JSON.parse(res.text);
+                    ob.should.have.property('result', 'Success');
+                    setTimeout(done, 100 * testUtils.testScalingFactor);
+                });
+        });
+    });
+
+    describe('Creating feedback event without widget_id', function() {
+        it('should success', function(done) {
+            API_KEY_ADMIN = testUtils.get("API_KEY_ADMIN");
+            APP_ID = testUtils.get("APP_ID");
+            APP_KEY = testUtils.get("APP_KEY");
+            WIDGET_ID = testUtils.get("WIDGET_ID");
+
+            var events = [{
+                "key": "[CLY]_star_rating",
+                "count": 1,
+                "sum": 1,
+                "segmentation": {
+                    "contactMe": true,
+                    "email": "someone@gmail.com",
+                    "comment": "It's a test comment.",
+                    "rating": 5,
+                    "app_version": "1.23",
+                    "platform": "iOS"
+                }
+            }];
+
+            request.get('/i?app_key=' + APP_KEY + '&device_id=' + 1 + "&events=" + JSON.stringify(events))
+                .expect(200)
+                .end(function(err, res) {
+                    if (err) {
+                        return done(err);
+                    }
+                    var ob = JSON.parse(res.text);
+                    ob.should.have.property('result', 'Success');
+                    setTimeout(done, 100 * testUtils.testScalingFactor);
+                });
+        });
+    });
+
+    describe('Request to validate feedback input for ratings', function() {
+        it('should success', function(done) {
+            API_KEY_ADMIN = testUtils.get("API_KEY_ADMIN");
+            APP_ID = testUtils.get("APP_ID");
+            APP_KEY = testUtils.get("APP_KEY");
+            WIDGET_ID = testUtils.get("WIDGET_ID");
+
+            var events = [{
+                "key": "[CLY]_star_rating",
+                "count": 1,
+                "timestamp": 1419432000000,
+                "hour": 10,
+                "dow": 2,
+                "segmentation": {
+                    "contactMe": true,
+                    "email": "someone@gmail.com",
+                    "comment": "It's a test comment.",
+                    "rating": 5,
+                    "app_version": "1.23",
+                    "platform": "iOS",
+                    "widget_id": WIDGET_ID
+                }
+            }];
+
+            request.get('/i/feedback/input?app_key=' + APP_KEY + '&device_id=' + 1 + "&events=" + JSON.stringify(events))
+                .expect(200)
+                .end(function(err, res) {
+                    if (err) {
+                        return done(err);
+                    }
+                    var ob = JSON.parse(res.text);
+                    ob.should.have.property('result', 'Success');
+                    setTimeout(done, 100 * testUtils.testScalingFactor);
+                });
+        });
+    });
+
+    describe('Removing widget', function() {
+        it('should success', function(done) {
+            API_KEY_ADMIN = testUtils.get("API_KEY_ADMIN");
+            APP_ID = testUtils.get("APP_ID");
+            WIDGET_ID = testUtils.get("WIDGET_ID");
+            request.get('/i/feedback/widgets/remove?api_key=' + API_KEY_ADMIN + '&app_id=' + APP_ID + '&widget_id=' + WIDGET_ID)
+                .expect(200)
+                .end(function(err, res) {
+                    if (err) {
+                        return done(err);
+                    }
+                    var ob = JSON.parse(res.text);
+                    ob.should.have.property('result', 'Success');
+                    setTimeout(done, 10 * testUtils.testScalingFactor);
+                });
+        });
+    });
+
+    describe('Creating widget before reset', function() {
+        it('should success', function(done) {
+            API_KEY_ADMIN = testUtils.get("API_KEY_ADMIN");
+            APP_ID = testUtils.get("APP_ID");
+            request.get('/i/feedback/widgets/create?api_key=' + API_KEY_ADMIN + '&app_id=' + APP_ID + '&popup_header_text=Widget which generated by test&popup_comment_callout=Leave comment&popup_email_callout=Leave email&popup_button_callout=Submit&popup_thanks_message=Thanks for feedback&trigger_position=mleft&trigger_bg_color=#123456&trigger_font_color=#122333&trigger_button_text=Leave feedback&target_devices={desktop:false,phone:true,tablet:true}&target_page=selected&target_pages=["/"]&is_active=true&hide_sticker=false')
+                .expect(201)
+                .end(function(err, res) {
+                    if (err) {
+                        return done(err);
+                    }
+                    var ob = JSON.parse(res.text);
+                    ob.result.should.match(/^Successfully created [0-9a-f]{24}$/);
+                    setTimeout(done, 10 * testUtils.testScalingFactor);
+                });
+        });
+    });
+
+    describe('Verify rating', function() {
+        it('should return 200 for request platform info', function(done) {
+            APP_ID = testUtils.get("APP_ID") || APP_ID;
+            var data;
+            request.get('/o?method=star&period=60days&api_key=' + API_KEY_ADMIN + '&app_id=' + APP_ID).end(function(err, res) {
+                res.statusCode.should.equal(200);
+                data = JSON.parse(res.text);
+                should(data.iOS && data.iOS.indexOf('1:23') >= 0).equal(true);
+                done();
+            });
+        });
+    });
+
+    var check_if_merges_finished = function(tries, done) {
+        if (tries == 3) {
+            done();
+        }
+        else {
+            testUtils.db.collection("app_user_merges").find({"_id": {"$regex": "^" + APP_ID}}).toArray(function(err, res) {
+                if (res && res.length > 0) {
+                    console.log(JSON.stringify(res));
+                    setTimeout(function() {
+                        check_if_merges_finished(tries + 1, done);
+                    }, 10000);
+                }
+                else {
+                    done();
+                }
+            });
+        }
+    };
+
+    describe('Test user merging', function() {
+        it('Send in some user', function(done) {
+            var events = [{
+                "key": "[CLY]_star_rating",
+                "count": 1,
+                "timestamp": 1419432000000,
+                "hour": 10,
+                "dow": 2,
+                "segmentation": {
+                    "contactMe": true,
+                    "email": "someone@gmail.com",
+                    "comment": "It's a old comment.",
+                    "rating": 5,
+                    "app_version": "5.5",
+                    "platform": "iOS",
+                    "widget_id": WIDGET_ID
+                }
+            }];
+
+            request.get('/i/feedback/input?app_key=' + APP_KEY + '&device_id=' + 'OLD' + "&events=" + JSON.stringify(events))
+                .expect(200)
+                .end(function(err, res) {
+                    if (err) {
+                        return done(err);
+                    }
+                    var ob = JSON.parse(res.text);
+                    ob.should.have.property('result', 'Success');
+                    setTimeout(done, 100 * testUtils.testScalingFactor);
+                });
+        });
+
+        it('Send in some other user', function(done) {
+            var events = [{
+                "key": "[CLY]_star_rating",
+                "count": 1,
+                "timestamp": 1419432000000,
+                "hour": 10,
+                "dow": 2,
+                "segmentation": {
+                    "contactMe": true,
+                    "email": "someoneNew@gmail.com",
+                    "comment": "It's a test comment.",
+                    "rating": 5,
+                    "app_version": "5.5",
+                    "platform": "iOS",
+                    "widget_id": WIDGET_ID
+                }
+            }];
+
+            request.get('/i/feedback/input?app_key=' + APP_KEY + '&device_id=' + 'NEW' + "&events=" + JSON.stringify(events))
+                .expect(200)
+                .end(function(err, res) {
+                    if (err) {
+                        return done(err);
+                    }
+                    var ob = JSON.parse(res.text);
+                    ob.should.have.property('result', 'Success');
+                    setTimeout(done, 100 * testUtils.testScalingFactor);
+                });
+        });
+
+        it('Merge users', function(done) {
+            request
+                .get('/i?device_id=NEW&old_device_id=OLD&app_key=' + APP_KEY)
+                .expect(200)
+                .end(function(err, res) {
+                    if (err) {
+                        return done(err);
+                    }
+                    var ob = JSON.parse(res.text);
+                    ob.should.have.property('result', 'Success');
+                    setTimeout(done, 100 * testUtils.testScalingFactor);
+                });
+        });
+        it('making sure merge is finished', function(done) {
+            check_if_merges_finished(0, done);
+        });
+        it('Validate in docs are correct in database', function(done) {
+            testUtils.db.collection("app_users" + APP_ID).findOne({"did": "NEW"}, function(err, res) {
+                if (err) {
+                    done("user not found");
+                }
+                else {
+                    var uid = res.uid;
+                    testUtils.db.collection("feedback" + APP_ID).find({"uid": uid}).toArray(function(err, res) {
+                        if (err) {
+                            done(err);
+                        }
+                        else {
+                            if (res && res.length === 2) {
+                                done();
+                            }
+                            else {
+                                console.log(JSON.stringify(res));
+                                done("feedback collection not properly merged. Expected 2 records.");
+                            }
+                        }
+                    });
+                }
+            });
+        });
+
+
+    });
+    describe('Reset app', function() {
+        it('should reset data', function(done) {
+            var params = {
+                app_id: APP_ID,
+                period: "reset"
+            };
+            request.get('/i/apps/reset?api_key=' + API_KEY_ADMIN + "&args=" + JSON.stringify(params)).expect(200).end(function(err, res) {
+                if (err) {
+                    return done(err);
+                }
+                var ob = JSON.parse(res.text);
+                ob.should.have.property('result', 'Success');
+                setTimeout(done, 500 * testUtils.testScalingFactor);
+            });
+        });
+    });
+
+    describe('Try to get widget list after reset app', function() {
+        it('should return 200 and empty widget list', function(done) {
+            API_KEY_ADMIN = testUtils.get("API_KEY_ADMIN");
+            APP_ID = testUtils.get("APP_ID");
+            request.get('/o/feedback/widgets?app_id=' + APP_ID + '&api_key=' + API_KEY_ADMIN)
+                .expect(200)
+                .end(function(err, res) {
+                    if (err) {
+                        return done(err);
+                    }
+                    var ob = JSON.parse(res.text);
+                    ob.length.should.eql(0);
+                    done();
+                });
+        });
+    });
+
+    describe('Try to get single widget with created widget\'s id after reset', function() {
+        it('should return 404', function(done) {
+            API_KEY_ADMIN = testUtils.get("API_KEY_ADMIN");
+            APP_ID = testUtils.get("APP_ID");
+            WIDGET_ID = testUtils.get("WIDGET_ID");
+            request.get('/o/feedback/widget?app_id=' + APP_ID + '&api_key=' + API_KEY_ADMIN + '&widget_id=' + WIDGET_ID)
+                .expect(404)
+                .end(function(err, res) {
+                    if (err) {
+                        return done(err);
+                    }
+                    done();
+                });
+        });
+    });
+
+
+    describe('Try to get widgets by array parameter with created widget\'s id after reset', function() {
+        it('should return widgets array', function(done) {
+            API_KEY_ADMIN = testUtils.get('API_KEY_ADMIN');
+            APP_ID = testUtils.get("APP_ID");
+            WIDGET_ID = testUtils.get('WIDGET_ID');
+            var array4query = [WIDGET_ID];
+            request.get('/o/feedback/multiple-widgets-by-id?app_id=' + APP_ID + '&api_key=' + API_KEY_ADMIN + '&widgets=' + JSON.stringify(array4query))
+                .expect(200)
+                .end(function(err, res) {
+                    if (err) {
+                        return done(err);
+                    }
+                    var ob = JSON.parse(res.text);
+                    ob.length.should.eql(0);
+                    done();
+                });
+        });
+    });
+
+    describe('Cross-app widget authorization', function() {
+        var victimAppId = "";
+        var victimWidgetId = "";
+        var scopedApiKey = "";
+        var scopedUserId = "";
+        var uniq = Date.now();
+
+        it('creates a victim app with a widget', function(done) {
+            API_KEY_ADMIN = testUtils.get("API_KEY_ADMIN");
+            request.get('/i/apps/create?api_key=' + API_KEY_ADMIN + '&args=' + encodeURIComponent(JSON.stringify({name: "SRVictimApp", type: "mobile"})))
+                .expect(200)
+                .end(function(err, res) {
+                    if (err) {
+                        return done(err);
+                    }
+                    victimAppId = res.body._id;
+                    request.get('/i/feedback/widgets/create?api_key=' + API_KEY_ADMIN + '&app_id=' + victimAppId + '&popup_header_text=victim&popup_comment_callout=c&popup_email_callout=e&popup_button_callout=s&popup_thanks_message=t&trigger_position=mleft&trigger_bg_color=%23123456&trigger_font_color=%23122333&trigger_button_text=fb&target_devices={desktop:false,phone:true,tablet:true}&target_page=selected&target_pages=["/"]&is_active=true&hide_sticker=false')
+                        .expect(201)
+                        .end(function(err2) {
+                            if (err2) {
+                                return done(err2);
+                            }
+                            request.get('/o/feedback/widgets?app_id=' + victimAppId + '&api_key=' + API_KEY_ADMIN)
+                                .expect(200)
+                                .end(function(err3, res3) {
+                                    if (err3) {
+                                        return done(err3);
+                                    }
+                                    victimWidgetId = JSON.parse(res3.text)[0]._id;
+                                    should.exist(victimWidgetId);
+                                    done();
+                                });
+                        });
+                });
+        });
+
+        it('creates a user scoped to the base app only', function(done) {
+            APP_ID = testUtils.get("APP_ID");
+            var perm = { _: {a: [], u: [APP_ID]}, c: {}, r: {}, u: {}, d: {} };
+            ["c", "r", "u", "d"].forEach(function(t) {
+                perm[t][APP_ID] = {all: false, allowed: {star_rating: true}};
+            });
+            var userParams = {full_name: "sruser" + uniq, username: "sruser" + uniq, password: "p4ssw0rD!", email: "sruser" + uniq + "@mail.test", permission: perm};
+            request.get('/i/users/create?api_key=' + API_KEY_ADMIN + '&args=' + encodeURIComponent(JSON.stringify(userParams)))
+                .expect(200)
+                .end(function(err, res) {
+                    if (err) {
+                        return done(err);
+                    }
+                    scopedApiKey = res.body.api_key;
+                    scopedUserId = res.body._id;
+                    should.exist(scopedApiKey);
+                    done();
+                });
+        });
+
+        it('does not return another app\'s widget from the list filtered by widget_id', function(done) {
+            APP_ID = testUtils.get("APP_ID");
+            request.get('/o/feedback/widgets?api_key=' + scopedApiKey + '&app_id=' + APP_ID + '&widget_id=' + victimWidgetId)
+                .expect(200)
+                .end(function(err, res) {
+                    if (err) {
+                        return done(err);
+                    }
+                    JSON.parse(res.text).should.eql([]);
+                    done();
+                });
+        });
+
+        it('rejects removing another app\'s widget', function(done) {
+            APP_ID = testUtils.get("APP_ID");
+            request.get('/i/feedback/widgets/remove?api_key=' + scopedApiKey + '&app_id=' + APP_ID + '&widget_id=' + victimWidgetId)
+                .expect(404)
+                .end(function(err) {
+                    return done(err);
+                });
+        });
+
+        it('leaves the victim widget intact after cross-app status/edit attempts', function(done) {
+            APP_ID = testUtils.get("APP_ID");
+            // bulk status executes but must match nothing in the attacker's app
+            request.get('/i/feedback/widgets/status?api_key=' + scopedApiKey + '&app_id=' + APP_ID + '&data=' + encodeURIComponent(JSON.stringify({[victimWidgetId]: false})))
+                .expect(200)
+                .end(function(errStatus) {
+                    if (errStatus) {
+                        return done(errStatus);
+                    }
+                    // edit must be rejected for a widget in another app
+                    request.get('/i/feedback/widgets/edit?api_key=' + scopedApiKey + '&app_id=' + APP_ID + '&widget_id=' + victimWidgetId + '&popup_header_text=hijacked')
+                        .expect(404)
+                        .end(function(errEdit) {
+                            if (errEdit) {
+                                return done(errEdit);
+                            }
+                            request.get('/o/feedback/widget?app_id=' + victimAppId + '&api_key=' + API_KEY_ADMIN + '&widget_id=' + victimWidgetId)
+                                .expect(200)
+                                .end(function(err, res) {
+                                    if (err) {
+                                        return done(err);
+                                    }
+                                    var w = JSON.parse(res.text);
+                                    //edit must not have rewritten the victim widget
+                                    w.should.have.property('popup_header_text', 'victim');
+                                    done();
+                                });
+                        });
+                });
+        });
+
+        after(function(done) {
+            request.get('/i/users/delete?api_key=' + API_KEY_ADMIN + '&args=' + encodeURIComponent(JSON.stringify({user_ids: [scopedUserId]})))
+                .end(function() {
+                    request.get('/i/apps/delete?api_key=' + API_KEY_ADMIN + '&args=' + encodeURIComponent(JSON.stringify({app_id: victimAppId})))
+                        .end(function() {
+                            done();
+                        });
+                });
+        });
+    });
+
+    describe('Try to get feedback data after reset', function() {
+        it('should return 200 and empty object', function(done) {
+            APP_ID = testUtils.get("APP_ID") || APP_ID;
+            var data;
+            request.get('/o?method=star&period=60days&api_key=' + API_KEY_ADMIN + '&app_id=' + APP_ID)
+                .expect(200)
+                .end(function(err, res) {
+                    var ob = JSON.parse(res.text);
+                    ob.should.eql({});
+                    done();
+                });
+        });
+    });
+});
+
+// Uploads are refused unless a plugin declares the request path, so a wrong
+// declaration silently turns /i/feedback/upload into an endpoint that reports an
+// invalid image. The control test establishes what that looks like, which is
+// what makes the second assertion mean something rather than pass for any
+// reason. This endpoint only serves when the surveys plugin is absent, which is
+// the case in this repo.
+describe('Feedback logo upload', function() {
+    var logo = require("path").resolve(__dirname, './../../frontend/express/public/images/favicon.png');
+
+    it('should reject when nothing is attached', function(done) {
+        API_KEY_ADMIN = testUtils.get("API_KEY_ADMIN");
+        request
+            .post('/i/feedback/upload?api_key=' + API_KEY_ADMIN)
+            .end(function(err, res) {
+                if (err) {
+                    return done(err);
+                }
+                // with no file there is nothing to store, and the endpoint says so
+                res.text.should.containEql('feedback.image');
+                done();
+            });
+    });
+
+    it('should receive an attached logo', function(done) {
+        API_KEY_ADMIN = testUtils.get("API_KEY_ADMIN");
+        request
+            .post('/i/feedback/upload?api_key=' + API_KEY_ADMIN)
+            .attach('feedback_logo', logo)
+            .expect(200)
+            .end(function(err, res) {
+                if (err) {
+                    return done(err);
+                }
+                // if /i/feedback/upload were not declared, the part would be
+                // dropped and this would be the invalid image response
+                var ob = JSON.parse(res.text);
+                ob.should.have.property('result', 'Success');
+                done();
+            });
+    });
+});

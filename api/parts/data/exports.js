@@ -1,0 +1,962 @@
+/**
+* This module is meant exporting data as csv or xls
+* @module api/parts/data/exports
+*/
+
+/** @lends module:api/parts/data/exports */
+var exports = {},
+    common = require('./../../utils/common.js'),
+    moment = require('moment-timezone'),
+    plugin = require('./../../../plugins/pluginManager.js'),
+    json2csv = require('json2csv');
+
+const log = require('./../../utils/log.js')('core:export');
+const { scopeQueryToApps } = require('./../../utils/rights.js');
+
+var XLSXTransformStream = require('xlsx-write-stream');
+const Transform = require('stream').Transform;
+var contents = {
+    "json": "application/json",
+    "csv": "text/csv",
+    "xls": "application/vnd.ms-excel",
+    "xlsx": "application/vnd.ms-excel"
+};
+var delimiter = "_";
+
+/**
+* Flattens array of objects
+* @param {array} arr - array with objects to flatten
+* @returns {object} with property data for array with flattened objects and fields property for fields array
+**/
+function flattenArray(arr) {
+    if (Array.isArray(arr)) {
+        var fields = {};
+        var l = arr.length;
+        for (var i = 0; i < l; i++) {
+            arr[i] = flattenObject(arr[i], fields);
+        }
+        return {
+            data: arr,
+            fields: Object.keys(fields)
+        };
+    }
+    return {
+        data: [],
+        fields: []
+    };
+}
+
+/**
+* Flattens nested object recursively
+* @param {object} ob - object to flatten
+* @param {object} fields - object with fields to store unique ones
+* @returns {object} flattened object
+**/
+function flattenObject(ob, fields) {
+    var toReturn = {};
+    for (var i in ob) {
+        if (ob[i] && ob[i]._bsontype) {
+            //this is ObjectID
+            ob[i] = ob[i] + "";
+        }
+        var type = Object.prototype.toString.call(ob[i]);
+        if (ob[i] && type === "[object Object]") {
+            var flatObject = flattenObject(ob[i]);
+            for (var x in flatObject) {
+                if (fields) {
+                    fields[i + delimiter + x] = true;
+                }
+                toReturn[i + delimiter + x] = preventCSVInjection(flatObject[x]);
+            }
+        }
+        else if (type === "[object Array]") {
+            var is_complex = false;
+            for (let p = 0; p < ob[i].length; p++) { //check if entities are complex.
+                let type1 = Object.prototype.toString.call(ob[i][p]);
+                if (ob[i][p] && (type1 === "[object Object]" || type1 === "[object Array]")) {
+                    is_complex = true;
+                }
+            }
+            if (!is_complex) {
+                if (fields) {
+                    fields[i] = true;
+                }
+                toReturn[i] = ob[i].join(", "); //just join values
+            }
+            else {
+                for (let p = 0; p < ob[i].length; p++) {
+                    if (fields) {
+                        fields[i + delimiter + p] = true;
+                    }
+                    toReturn[i + delimiter + p] = JSON.stringify(ob[i][p]); //stringify values
+                }
+            }
+
+        }
+        else {
+            if (fields) {
+                fields[i] = true;
+            }
+            toReturn[i] = ob[i];
+        }
+    }
+    return toReturn;
+}
+
+//A leading one of these makes a spreadsheet client read the cell as a formula. The
+//first four are the formula introducers; a leading tab or carriage return is consumed
+//by the client while it parses the file, exposing whatever follows it, so they belong
+//here too.
+var CSV_FORMULA_PREFIXES = ["@", "=", "+", "-", "\t", "\r"];
+var CSV_FORMULA_MARKER = "'";
+
+/**
+ *  Escape values that can cause CSV injection
+ *
+ *  CSV only. flattenObject feeds the xls, xlsx and json paths as well, and those writers
+ *  emit typed cells or JSON strings rather than anything a spreadsheet parses as a
+ *  formula, so neutralizing there would put a marker into values that need none. This is
+ *  called where CSV text is produced instead: processCSVvalue for the streamed writer,
+ *  and convertData's csv branch for the buffered one.
+ *
+ *  Safe to apply twice - a value already carrying the marker is returned untouched -
+ *  because a cell can reach it from a row and again from a serializer.
+ *
+ *  @param {varies} val - value to escape
+ *  @returns {varies} escaped value
+ */
+function preventCSVInjection(val) {
+    if (typeof val === "string" && val.length) {
+        if (val[0] === CSV_FORMULA_MARKER) {
+            return val;
+        }
+        if (CSV_FORMULA_PREFIXES.indexOf(val[0]) !== -1) {
+            val = CSV_FORMULA_MARKER + val;
+        }
+    }
+    return val;
+}
+
+/**
+* Function to make all values CSV friendly
+* @param {string} value - value to convert
+* @returns {string}   - converted string
+*/
+function processCSVvalue(value) {
+    if (value === null || value === undefined) {
+        return undefined;
+    }
+
+    const valueType = typeof value;
+    if (valueType !== 'boolean' && valueType !== 'number' && valueType !== 'string') {
+        value = JSON.stringify(value);
+
+        if (value === undefined) {
+            return undefined;
+        }
+        if (value[0] === '"') {
+            value = value.replace(/^"(.+)"$/, '$1');
+        }
+    }
+
+    if (typeof value === 'string') {
+        //Neutralize before quoting. The quotes added below are the CSV text qualifier
+        //and the spreadsheet client strips them while parsing, so quoting is not
+        //protection against a formula introducer. Doing it here covers every cell the
+        //streamed CSV writes, headers included, rather than at each call site: the
+        //header rows and the data rows are written from three separate places, and only
+        //the rows built without a projection pass through flattenObject on the way.
+        value = preventCSVInjection(value);
+
+        if (value.includes('"')) {
+            value = value.replace(new RegExp('"', 'g'), '"' + '"');
+        }
+
+        value = '"' + value + '"';
+    }
+
+    return value;
+}
+
+/**
+* Convert json object to needed data type
+* @param {array} data - data to convert
+* @param {string} type - type to which to convert
+* @returns {string} converted data
+*/
+exports.convertData = function(data, type) {
+    let obj;
+    switch (type) {
+    case "json":
+        return JSON.stringify(data);
+    case "csv":
+        obj = flattenArray(data);
+        //the buffered csv writer. json2csv quotes but does not neutralize, and quoting is
+        //the text qualifier rather than protection: the client strips it while parsing.
+        //Field names are attacker controlled too when they come from event segmentation,
+        //and json2csv writes them as the header row.
+        return json2csv.parse(obj.data.map(function(row) {
+            var neutralized = {};
+            for (var key in row) {
+                neutralized[key] = preventCSVInjection(row[key]);
+            }
+            return neutralized;
+        }), {fields: obj.fields.map(preventCSVInjection), excelStrings: false});
+    case "xls":
+    case "xlsx":
+        obj = flattenArray(data);
+        var stream = new XLSXTransformStream();
+        stream.write(obj.fields);
+        for (var k = 0; k < obj.data.length; k++) {
+            var arr1 = [];
+            for (var z = 0; z < obj.fields.length; z++) {
+                arr1.push(obj.data[k][obj.fields[z]] || "");
+            }
+            stream.write(arr1);
+        }
+        stream.end();
+
+        return stream;
+    default:
+        return data;
+    }
+};
+
+exports.getType = function(key) {
+    if (contents[key]) {
+        return contents[key];
+    }
+    else {
+        return key;
+    }
+};
+/**
+* Output data as response
+* @param {params} params - params object
+* @param {string} data - data to output
+* @param {string} filename - name of the file to output to browser
+* @param {string} type - type to be used in content type
+*/
+exports.output = function(params, data, filename, type) {
+    var headers = {};
+    if (type && contents[type]) {
+        headers["Content-Type"] = contents[type];
+    }
+    headers["Content-Disposition"] = "attachment;filename=" + encodeURIComponent(filename) + "." + type;
+
+    if (type === "xlsx" || type === "xls") { //we have stream
+        params.res.writeHead(200, headers);
+        data.on("error", function(streamErr) {
+            common.log("exports").e(streamErr);
+            if (!params.res.headersSent) {
+                common.returnMessage(params, 500, "Export stream error");
+            }
+            else {
+                params.res.end();
+            }
+        });
+        data.pipe(params.res);
+        //common.returnRaw(params, 200, new Buffer(data, 'binary'), headers);
+    }
+    else {
+        common.returnRaw(params, 200, data, headers);
+    }
+};
+
+/**
+* Transform value
+* @param {object} value - any value
+* @param {string} key - key
+* @param {object} mapper - object with information how to transform data
+* @param {object} doc - original document
+* @returns {string} transformed value
+*/
+function transformValue(value, key, mapper, doc) {
+    if (mapper && mapper.fields && mapper.fields[key]) {
+        //if we need we can easy add later different transformations and pass other params for them
+        if (mapper.fields[key].formula) {
+            if (mapper.fields[key].formula.$eq) {
+                value = doc[mapper.fields[key].formula.$eq];
+            }
+        }
+        if (mapper.fields[key].to && mapper.fields[key].to === "time") {
+            if (value) {
+                if (Math.round(value).toString().length === 10) {
+                    value *= 1000;
+                }
+                value = moment(new Date(value)).tz(mapper.tz);
+                if (value) {
+                    var format = "ddd, D MMM YYYY HH:mm:ss";
+                    if (mapper.fields[key].format) {
+                        format = mapper.fields[key].format;
+                    }
+                    value = value.format(format);
+                }
+                else {
+                    value /= 1000;
+                }
+            }
+        }
+        if (mapper.fields[key].type) {
+            switch (mapper.fields[key].type) {
+            case "number":
+                value = common.formatNumber(value);
+                break;
+            case "second":
+                value = common.formatSecond(value);
+                break;
+            }
+        }
+        return value;
+    }
+    else {
+        return value;
+    }
+}
+
+/**
+* Transform all values in object
+* @param {object} doc - any value
+* @param {object} mapper - object with information how to transform data
+* @returns {object} object with transformed data
+*/
+function transformValuesInObject(doc, mapper) {
+    var docOrig = JSON.parse(JSON.stringify(doc));
+    for (var z in doc) {
+        doc[z] = transformValue(doc[z], z, mapper, docOrig);
+    }
+    if (mapper && mapper.calculated_fields) {
+        for (var n = 0; n < mapper.calculated_fields.length; n++) {
+            doc[mapper.calculated_fields[n]] = transformValue(0, mapper.calculated_fields[n], mapper, docOrig);
+        }
+    }
+    return doc;
+}
+
+exports.transformValuesInObject = transformValuesInObject;
+
+/**
+* function to collect calues in order based on current order.
+* @param {array} values - arary to collect values
+* @param {object} valuesMap - object to see which values are collected
+* @param {array} paramList - array of keys(in order)
+* @param {object} doc - data from db
+* @param {object} options -{options.collectProp = true if collect properties,if false use only listed(from projection), options.mapper - mapper for fransforming data}
+*/
+function getValues(values, valuesMap, paramList, doc, options) {
+    if (options && options.collectProp) {
+        doc = flattenObject(doc);
+        var docOrig = JSON.parse(JSON.stringify(doc));
+        var keys = Object.keys(doc);
+        for (var z = 0; z < keys.length; z++) {
+            valuesMap[keys[z]] = false;
+        }
+        for (var p = 0; p < paramList.length; p++) {
+            if (doc[paramList[p]]) {
+                values.push(transformValue(doc[paramList[p]], paramList[p], options.mapper, docOrig));
+            }
+            else {
+                values.push("");
+            }
+            valuesMap[paramList[p]] = true;
+        }
+        for (var k in valuesMap) {
+            if (valuesMap[k] === false) {
+                values.push(transformValue(doc[k], k, options.mapper, docOrig));
+                paramList.push(k);
+            }
+        }
+    }
+    else {
+        for (var kz = 0; kz < paramList.length; kz++) {
+            var value = common.getDescendantProp(doc, paramList[kz]) || "";
+            if (typeof value === 'object' || Array.isArray(value)) {
+                values.push(JSON.stringify(transformValue(value, paramList[kz], options.mapper, docOrig)));
+            }
+            else {
+                values.push(transformValue(value, paramList[kz], options.mapper));
+            }
+        }
+    }
+}
+/**
+* Stream data as response
+* @param {params} params - params object
+* @param {Stream} stream - cursor object. Need to call stream on it. 
+* @param {string} options - options object 
+		options.filename - name of the file to output to browser
+		options.type - type to be used in content type
+		options.projection - object of field projection
+		options.mapper - object of mapping if need to transform data(for example timestamp to date string)
+*/
+exports.stream = function(params, stream, options) {
+    var headers = {};
+    var emptyFun = function(val) {
+        return val;
+    };
+    var transformFunction = options.transformFunction || emptyFun;
+    var filename = options.filename;
+    var type = options.type;
+    var projection = options.projection;
+    var mapper = options.mapper;
+    var listAtEnd = true;
+    if (type && contents[type]) {
+        headers["Content-Type"] = contents[type];
+    }
+    headers["Content-Disposition"] = "attachment;filename=" + encodeURIComponent(filename) + "." + type;
+    var paramList = [];
+    if (projection) {
+        for (var k in projection) { //keep order as in projection if given
+            paramList.push(k);
+            listAtEnd = false;
+        }
+    }
+    if (options.writeHeaders && params.res.writeHead) {
+        params.res.writeHead(200, headers);
+    }
+    if (type === "csv") {
+        options.streamOptions.transform = transformFunction;
+        var head = [];
+        if (listAtEnd === false) {
+            for (let p = 0; p < paramList.length; p++) {
+                head.push(processCSVvalue(paramList[p]));
+            }
+            params.res.write(head.join(',') + '\r\n');
+        }
+
+        stream.stream(options.streamOptions).on('data', function(doc) {
+            var values = [];
+            var valuesMap = {};
+            getValues(values, valuesMap, paramList, doc, {mapper: mapper, collectProp: listAtEnd}); // if we have list at end - then we don'thave projection
+
+            for (let p = 0; p < values.length; p++) {
+                values[p] = processCSVvalue(values[p]);
+            }
+            params.res.write(values.join(',') + '\r\n');
+        });
+
+        stream.once('close', function() {
+            setTimeout(function() {
+                if (listAtEnd) {
+                    for (var p = 0; p < paramList.length; p++) {
+                        head.push(processCSVvalue(paramList[p]));
+                    }
+                    params.res.write(head.join(',') + '\r\n');
+                }
+                params.res.end();
+            }, 100);
+        });
+    }
+    else if (type === 'xlsx' || type === 'xls') {
+        options.streamOptions.transform = transformFunction;
+        var xc = new XLSXTransformStream();
+        xc.on("error", function(streamErr) {
+            common.log("exports").e(streamErr);
+            if (!params.res.headersSent) {
+                common.returnMessage(params, 500, "Export stream error");
+            }
+            else {
+                params.res.end();
+            }
+        });
+        xc.pipe(params.res);
+        if (listAtEnd === false) {
+            xc.write(paramList);
+        }
+        stream.stream(options.streamOptions).on('data', function(doc) {
+            var values = [];
+            var valuesMap = {};
+            getValues(values, valuesMap, paramList, doc, {mapper: mapper, collectProp: listAtEnd});
+            //no CSV neutralization here: this is the xlsx writer, which emits typed cells
+            //rather than CSV text, so a formula introducer is not one
+            xc.write(values);
+        });
+
+        stream.once('close', function() {
+            setTimeout(function() {
+                if (listAtEnd) {
+                    xc.write(paramList);
+                }
+                xc.end();
+            }, 100);
+        });
+    }
+    else {
+        params.res.write("[");
+        var first = false;
+        stream.stream(options.streamOptions).on('data', function(doc) {
+            if (!first) {
+                first = true;
+                params.res.write(doc);
+            }
+            else {
+                params.res.write("," + doc);
+            }
+        });
+
+        stream.once('close', function() {
+            setTimeout(function() {
+                params.res.write("]");
+                params.res.end();
+            }, 100);
+        });
+    }
+};
+
+/**
+ * Check if id is valid ObjectID
+ * @param {string} id - id to check
+ * @returns {boolean} true if valid
+ * */
+function isObjectId(id) {
+    var checkForHexRegExp = new RegExp("^[0-9a-fA-F]{24}$");
+    if (typeof id === "undefined" || id === null) {
+        return false;
+    }
+    if ((typeof id !== "undefined" && id !== null) && 'number' !== typeof id && (id.length !== 24)) {
+        return false;
+    }
+    else {
+        // Check specifically for hex correctness
+        if (typeof id === 'string' && id.length === 24) {
+            return checkForHexRegExp.test(id);
+        }
+        return true;
+    }
+}
+
+/**
+* Export data from database
+* @param {object} options - options for the export
+* @param {object} options.db - database connection
+* @param {params} options.params - params object
+* @param {string} options.collection - name of the collection to export
+* @param {object} [options.query={}] - database query which data to filter
+* @param {object} [options.projection={}] - database projections which fields to return
+* @param {object} [options.sort=natural] - sort object for cursor
+* @param {number} [options.limit=10000] - amount of items to output
+* @param {number} [options.skip=0] - amount of items to skip from start
+* @param {string} [options.type=json] - type of data to output
+* @param {string} [options.filename] - name of the file to output, by default auto generated
+* @param {Function} options.output - callback function where to pass data, by default outputs as file based on type
+*/
+
+/**
+* Credential fields stripped from privileged collections on export, mirroring
+* the DB Viewer read paths so the same data cannot be obtained through export.
+*/
+var EXPORT_REDACTIONS = {
+    "members": ["password", "api_key", "two_factor_auth"],
+    "auth_tokens": ["_id"]
+};
+
+/**
+* Whether documents from the given collection require credential redaction on export
+* @param {string} collection - collection name
+* @returns {boolean} true if the collection is redacted on export
+*/
+exports.redactsExportCollection = function(collection) {
+    return Object.prototype.hasOwnProperty.call(EXPORT_REDACTIONS, collection);
+};
+
+/**
+* Remove/mask credential fields from a document before it is written to an export
+* @param {string} collection - collection the document belongs to
+* @param {object} doc - document to redact (mutated and returned)
+* @returns {object} the redacted document
+*/
+exports.redactExportDoc = function(collection, doc) {
+    if (!doc || !exports.redactsExportCollection(collection)) {
+        return doc;
+    }
+    var fields = EXPORT_REDACTIONS[collection];
+    for (var i = 0; i < fields.length; i++) {
+        if (fields[i] === "_id") {
+            // _id is normally present (fromDatabase keeps it unless explicitly
+            // excluded via projection), so mask its value rather than deleting it
+            if (typeof doc._id !== "undefined") {
+                doc._id = "***redacted***";
+            }
+        }
+        else {
+            delete doc[fields[i]];
+        }
+    }
+    return doc;
+};
+
+exports.fromDatabase = function(options) {
+    options.db = options.db || common.db;
+    options.query = options.query || {};
+    options.projection = options.projection || {};
+    options.writeHeaders = true;
+
+    // Reject (never modify) export queries that contain disallowed Mongo
+    // operators ($where/$function/$accumulator). options.query is dispatched to
+    // /drill/preprocess_query and then run against the database; the dispatch
+    // hook no longer strips these operators, so validate the already-parsed
+    // query here at the boundary into the dispatch + DB find.
+    var badOp = common.findUnsafeMongoOperator(options.query);
+    if (badOp) {
+        log.d("Rejected user query" + common.reqInfo(options.params) + ": " + common.unsafeQueryError(badOp));
+        if (options.params) {
+            common.returnMessage(options.params, 400, common.unsafeQueryError(badOp));
+        }
+        return;
+    }
+
+    if (options.params && options.params.qstring && options.params.qstring.formatFields) {
+        options.mapper = options.params.qstring.formatFields;
+    }
+
+    if (options.limit && options.limit !== "") {
+        options.limit = parseInt(options.limit, 10);
+        if (options.limit > plugin.getConfig("api").export_limit) {
+            options.limit = plugin.getConfig("api").export_limit;
+        }
+    }
+    if (Object.keys(options.projection).length > 0) {
+        if (!options.projection._id) { //because it will be returned anyway
+            options.projection._id = 1;
+        }
+    }
+    var alternateName = (options.collection.charAt(0).toUpperCase() + options.collection.slice(1).toLowerCase());
+    if (options.skip) {
+        alternateName += "_from_" + options.skip;
+        if (options.limit) {
+            alternateName += "_to_" + (parseInt(options.skip) + parseInt(options.limit));
+        }
+    }
+    alternateName += "_exported_on_" + moment().format("DD-MMM-YYYY");
+    options.filename = options.filename || options.params.qstring.filename || alternateName;
+
+    if (options.collection.startsWith("app_users")) {
+        options.params.qstring.method = "user_details";
+        options.params.app_id = options.collection.replace("app_users", "");
+    }
+
+    if (options.params && options.params.qstring && options.params.qstring.get_index && options.params.qstring.get_index !== null) {
+        options.db.collection(options.collection).indexes(function(err, indexes) {
+            if (!err) {
+                exports.fromData(indexes, options);
+            }
+        });
+    }
+    else {
+        plugin.dispatch("/drill/preprocess_query", {
+            query: options.query,
+            params: options.params
+        }, ()=>{
+            if (options.query._id && isObjectId(options.query._id)) {
+                options.query._id = common.db.ObjectID(options.query._id);
+            }
+            // The app scope is added only now, after every listener has rewritten the
+            // query, so no listener can reshape or drop it.
+            var findQuery = scopeQueryToApps(options.appFilter, options.query);
+            var cursor = options.db.collection(options.collection).find(findQuery, {"projection": options.projection});
+            // Strip credential material from privileged collections before it
+            // can reach an export file, mirroring the DB Viewer read paths. This
+            // runs at the cursor level so it applies regardless of output type
+            // (json/csv/xls) and regardless of the caller supplied projection.
+            if (exports.redactsExportCollection(options.collection)) {
+                cursor = cursor.map(function(doc) {
+                    return exports.redactExportDoc(options.collection, doc);
+                });
+            }
+            if (options.sort) {
+                cursor.sort(options.sort);
+            }
+
+            if (options.skip) {
+                cursor.skip(parseInt(options.skip));
+            }
+            if (options.limit) {
+                cursor.limit(parseInt(options.limit));
+            }
+            options.streamOptions = {};
+            if (options.type === "stream" || options.type === "json") {
+                options.streamOptions.transform = function(doc) {
+                    doc = transformValuesInObject(doc, options.mapper);
+                    return JSON.stringify(doc);
+                };
+            }
+            if (options.type === "stream" || options.type === "json" || options.type === "xls" || options.type === "xlsx" || options.type === "csv") {
+                options.output = options.output || function(stream) {
+                    exports.stream(options.params, stream, options);
+                };
+                options.output(cursor);
+            }
+            else {
+                cursor.toArray(function(err, data) {
+                    exports.fromData(data, options);
+                });
+            }
+        });
+    }
+};
+
+/**
+* Export data from response of request
+* @param {object} options - options for the export
+* @param {params} options.params - params object
+* @param {object} options.path - path for api endpoint
+* @param {object} options.data - json data to use as post or query string
+* @param {object} options.prop - which property to export, tries to export whole response if not provided
+* @param {object} [options.method=POST] - request method type
+* @param {string} [options.type=json] - type of data to output
+* @param {string} [options.filename] - name of the file to output, by default auto generated
+* @param {Function} options.output - callback function where to pass data, by default outputs as file based on type
+*/
+exports.fromRequest = function(options) {
+    options.path = options.path || "/";
+    if (!options.path.startsWith("/")) {
+        options.path = "/" + options.path;
+    }
+    options.filename = options.filename || options.path.replace(/\//g, "_") + "_on_" + moment().format("DD-MMM-YYYY");
+
+
+    //creating request context
+    var params = {
+        //providing data in request object
+        'req': {
+            url: options.path,
+            body: options.data || {},
+            method: "export"
+        },
+        //adding custom processing for API responses
+        'APICallback': function(err, body) {
+            if (err) {
+                log.e(err);
+                log.e(JSON.stringify(body));
+            }
+            var data = [];
+            try {
+                if (options.prop) {
+                    var path = options.prop.split(".");
+                    for (var i = 0; i < path.length; i++) {
+                        body = body[path[i]];
+                    }
+                }
+                if (options.projection) {
+                    for (var key in body) {
+                        for (var prop in body[key]) {
+                            if (!options.projection[prop]) {
+                                delete body[key][prop];
+                            }
+                        }
+                    }
+                }
+                if (options.columnNames || options.mapper) {
+                    for (key in body) {
+                        // a key off a stored document or a parsed payload can be a prototype
+                        // member name; writing through one would reach Object.prototype
+                        if (key === "__proto__" || key === "constructor" || key === "prototype") {
+                            continue;
+                        }
+                        if (options.mapper) {
+                            body[key] = transformValuesInObject(body[key], options.mapper);
+                        }
+                        for (prop in body[key]) {
+                            if (options.columnNames) {
+                                if (options.columnNames[prop]) {
+                                    body[key][options.columnNames[prop]] = body[key][prop];
+                                    delete body[key][prop];
+                                }
+                            }
+                        }
+                    }
+                }
+                data = body;
+            }
+            catch {
+                data = [];
+            }
+            //"stream all data"
+            exports.fromData(data, options);
+        }
+    };
+
+    //processing request
+    common.processRequest(params);
+};
+
+
+/**
+ * Look for an aggregation stage that writes, at any nesting depth.
+ *
+ * Sub-pipelines inside $lookup, $unionWith and $facet are searched too, so a write cannot be
+ * hidden one level down. Names are matched as object keys, which is the only place a stage
+ * operator appears.
+ *
+ * The node budget is a stop on runaway work, not a verdict. Exhausting it means the
+ * pipeline could not be verified, which is a reason to refuse rather than to proceed:
+ * returning "nothing found" there would let a large enough structure in front of an
+ * $out carry the write through.
+ *
+ * @param {Array} pipeline - aggregation pipeline to inspect
+ * @returns {string|null} why the pipeline must be refused, or null when it is safe
+ */
+function findWriteStage(pipeline) {
+    var WRITE_STAGES = ["$out", "$merge"];
+    var MAX_NODES = 10000;
+    var seen = 0;
+    var exhausted = false;
+
+    /**
+     * @param {*} node - value to walk
+     * @returns {string|null} offending stage name or null
+     */
+    function walk(node) {
+        if (seen++ > MAX_NODES) {
+            exhausted = true;
+            return null;
+        }
+        if (!node || typeof node !== "object") {
+            return null;
+        }
+        if (Array.isArray(node)) {
+            for (var i = 0; i < node.length; i++) {
+                var fromItem = walk(node[i]);
+                if (fromItem) {
+                    return fromItem;
+                }
+            }
+            return null;
+        }
+        //Object.keys rather than for...in: node is a parsed request payload, and an
+        //inherited enumerable key is not part of the pipeline the caller sent. Walking
+        //one would let a poisoned prototype decide what this scan looks at, which is the
+        //opposite of what a guard should allow. The platform copy of this function
+        //already reads it this way.
+        var keys = Object.keys(node);
+        for (var k = 0; k < keys.length; k++) {
+            var key = keys[k];
+            if (WRITE_STAGES.indexOf(key) !== -1) {
+                return key;
+            }
+            var fromValue = walk(node[key]);
+            if (fromValue) {
+                return fromValue;
+            }
+        }
+        return null;
+    }
+    var found = walk(pipeline);
+    if (found) {
+        return "write stage " + found;
+    }
+    //fail closed: unverified is not the same as verified safe
+    return exhausted ? "pipeline too large to verify (over " + MAX_NODES + " nodes)" : null;
+}
+
+exports.fromRequestQuery = function(options) {
+    options.db = options.db || common.db;
+    options.path = options.path || "/";
+    if (!options.path.startsWith("/")) {
+        options.path = "/" + options.path;
+    }
+    options.filename = options.filename || options.path.replace(/\//g, "_") + "_on_" + moment().format("DD-MMM-YYYY");
+
+
+    //creating request context
+    var params = {
+        //providing data in request object
+        'req': {
+            url: options.path,
+            //Deliberately empty. The endpoint being re-run supplies the collection and the
+            //pipeline, and that is only trustworthy while the caller cannot influence what it
+            //returns. processRequest copies every key of this body onto the inner request's
+            //params.qstring, so anything here reaches the endpoint as if it were a query
+            //parameter: an endpoint that keeps unrecognised parameters and returns what it
+            //stored would echo a caller-supplied collection and pipeline back to us. Every
+            //caller in the product passes its parameters in the path's query string instead,
+            //so there is nothing to forward.
+            body: {},
+            method: "export"
+        },
+        //adding custom processing for API responses
+        'APICallback': function(err, body) {
+            if (err) {
+                log.e(err);
+            }
+            if (body) {
+                //A spec is the endpoint's own work, so its stages are trusted, but no endpoint
+                //has any reason to write. Refusing $out and $merge at any depth keeps a buggy
+                //or tampered spec from turning a read into a write.
+                var writeStage = findWriteStage(body.pipeline);
+                if (writeStage) {
+                    log.e("Refusing export query: " + writeStage);
+                    var refused = new Transform({
+                        objectMode: true,
+                        transform: (data, _, done) => {
+                            done(null, data);
+                        }
+                    });
+                    refused.end();
+                    options.output(refused);
+                    return;
+                }
+                if (body.transformFunction) {
+                    options.transformFunction = body.transformFunction;
+                }
+                var cursor = options.db.collection(body.collection).aggregate(body.pipeline);
+                options.projection = body.projection;
+                var outputStream = new Transform({
+                    objectMode: true,
+                    transform: (data, _, done) => {
+                        done(null, data);
+                    }
+                });
+                options.streamOptions = {};
+                if (options.type === "stream" || options.type === "json") {
+                    options.streamOptions.transform = function(doc) {
+                        doc = transformValuesInObject(doc, options.mapper);
+                        if (body.transformFunction) {
+                            return JSON.stringify(body.transformFunction(doc));
+                        }
+                        else {
+                            return JSON.stringify(doc);
+                        }
+                    };
+                }
+                exports.stream({res: outputStream}, cursor, options);
+
+                options.output(outputStream);
+            }
+        }
+    };
+
+    //processing request
+    common.processRequest(params);
+};
+
+/**
+* Create export from provided data
+* @param {string|array} data - data to format
+* @param {object} options - options for the export
+* @param {params} options.params - params object
+* @param {string} [options.type=json] - type of data to output
+* @param {string} [options.filename] - name of the file to output, by default auto generated
+* @param {Function} options.output - callback function where to pass data, by default outputs as file based on type
+*/
+exports.fromData = function(data, options) {
+    options.type = options.type || "json";
+    options.filename = options.filename || "Data_export_on_" + moment().format("DD-MMM-YYYY");
+    options.output = options.output || function(odata) {
+        exports.output(options.params, odata, options.filename, options.type);
+    };
+    if (!data) {
+        data = [];
+    }
+    if (typeof data === "object") {
+        data = Object.values(data);
+    }
+    if (typeof data === "string") {
+        options.output(data);
+    }
+    else {
+        options.output(exports.convertData(data, options.type));
+    }
+};
+
+module.exports = exports;

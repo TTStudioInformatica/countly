@@ -1,0 +1,554 @@
+var should = require("should");
+var testUtils = require("../testUtils");
+var common = require("../../api/utils/common");
+const mongodb = require('mongodb');
+
+describe("Common API utility functions", function() {
+    describe("versionCompare", function() {
+        function testCompare(v1, v2, expected) {
+            common.versionCompare(v1, v2).should.equal(expected);
+            common.versionCompare(v2, v1).should.equal(expected * -1);
+        }
+
+        it("should compare versions correctly", function(done) {
+            testCompare("1:0", "1:1", -1);
+            testCompare("2:0", "1:1", 1);
+
+            testCompare("1:0+builtonmars", "1:0+builtonearth", 0);
+
+            testCompare("1:0:1", "1:0", 1);
+
+            testCompare("5:3-beta", "5:3", -1);
+            testCompare("5:3-251e6992f5", "5:3-303535874", 0);
+
+            testCompare("9:74AGT", "9:80AGT", -1);
+            testCompare("10:14AGT", "9:80AGT", 1);
+
+            done();
+        });
+    });
+
+    describe('validateArgs extra types', () => {
+        common.db = common.db || {
+            _ObjectId: mongodb.ObjectId
+        };
+
+        it('should validate ObjectId', () => {
+            let id = new mongodb.ObjectId(),
+                scheme = {
+                    id: { type: 'ObjectID', required: true },
+                    idstr: { type: 'ObjectID', required: true }
+                };
+
+            should.deepEqual(common.validateArgs({id, idstr: id.toString()}, scheme), {id, idstr: id});
+            should.deepEqual(common.validateArgs({id, idstr: id.toString()}, scheme, true), {errors: [], result: true, obj: {id, idstr: id}});
+            should.deepEqual(common.validateArgs({id}, scheme, true), {errors: ['Missing idstr argument'], result: false});
+            should.deepEqual(common.validateArgs({id: 'asd', idstr: id.toString()}, scheme, true), {errors: ['Incorrect ObjectID for id'], result: false});
+            should.deepEqual(common.validateArgs({id: id.toString(), idstr: id.toString()}, scheme, true), {errors: [], result: true, obj: {id: id, idstr: id}});
+        });
+
+        it('should validate ObjectId[]', () => {
+            let id1 = new mongodb.ObjectId(),
+                id2 = new mongodb.ObjectId(),
+                scheme = {
+                    ids: { type: 'ObjectID[]', required: true },
+                };
+
+            should.deepEqual(common.validateArgs({ids: []}, scheme), {ids: []});
+            should.deepEqual(common.validateArgs({ids: [id1, id2]}, scheme), {ids: [id1, id2]});
+            should.deepEqual(common.validateArgs({ids: [id1.toString(), id2]}, scheme, true), {errors: [], result: true, obj: {ids: [id1, id2]}});
+            should.deepEqual(common.validateArgs({}, scheme, true), {errors: ['Missing ids argument'], result: false});
+            should.deepEqual(common.validateArgs({ids: {}}, scheme, true), {errors: ['Invalid type for ids'], result: false});
+            should.deepEqual(common.validateArgs({ids: id1}, scheme, true), {errors: ['Invalid type for ids'], result: false});
+            should.deepEqual(common.validateArgs({ids: 123}, scheme, true), {errors: ['Invalid type for ids'], result: false});
+            should.deepEqual(common.validateArgs({ids: id1.toString()}, scheme, true), {errors: ['Invalid type for ids'], result: false});
+            should.deepEqual(common.validateArgs({ids: ['a']}, scheme, true), {errors: ['ids: Incorrect ObjectID for 0'], result: false});
+            should.deepEqual(common.validateArgs({ids: [id1, id2.toString(), 'a']}, scheme, true), {errors: ['ids: Incorrect ObjectID for 2'], result: false});
+        });
+
+        it('should validate inner scheme', () => {
+            let id = new mongodb.ObjectId(),
+                scheme = {
+                    _id: { type: 'ObjectID', required: true },
+                    num: { type: 'Number' },
+                    object: {
+                        type: {
+                            str: { type: 'String', required: true },
+                            ids: { type: 'ObjectID[]' }
+                        }
+                    },
+                    array: {
+                        type: {
+                            str: { type: 'String', required: true },
+                            ids: { type: 'ObjectID[]' }
+                        },
+                        array: true
+                    },
+                };
+
+            should.deepEqual(common.validateArgs({_id: id}, scheme), {_id: id});
+            should.deepEqual(common.validateArgs({}, scheme, true), {errors: ['Missing _id argument'], result: false});
+            should.deepEqual(common.validateArgs({
+                _id: id,
+                object: {}
+            }, scheme, true), {
+                result: false,
+                errors: ['object: Missing str argument']
+            });
+            should.deepEqual(common.validateArgs({
+                _id: id,
+                object: {
+                    str: 'str',
+                    ids: [id, 'a']
+                }
+            }, scheme, true), {
+                result: false,
+                errors: ['object: ids: Incorrect ObjectID for 1']
+            });
+            should.deepEqual(common.validateArgs({
+                _id: id,
+                array: [{
+                    str: 'str',
+                    ids: [id, 'a']
+                }]
+            }, scheme, true), {
+                result: false,
+                errors: ['array: 0: ids: Incorrect ObjectID for 1']
+            });
+            should.deepEqual(common.validateArgs({
+                _id: id,
+                array: [[]]
+            }, scheme, true), {
+                result: false,
+                errors: ['array: 0: Missing str argument']
+            });
+            should.deepEqual(common.validateArgs({
+                _id: id,
+                array: [Number(5)]
+            }, scheme, true), {
+                result: false,
+                errors: ['array: Invalid type for 0', 'array: 0: Missing str argument']
+            });
+        });
+
+        it('should validate in', () => {
+            let schemeString = {
+                    data: { type: 'String', in: ['a', 'b', 'c'] },
+                },
+                schemeArray = {
+                    data: { type: 'String[]', in: () => ['a', 'b', 'c'] },
+                };
+
+            should.deepEqual(common.validateArgs({}, schemeString), {});
+            should.deepEqual(common.validateArgs({data: 'a'}, schemeString), {data: 'a'});
+            should.deepEqual(common.validateArgs({data: 'b'}, schemeString), {data: 'b'});
+            should.deepEqual(common.validateArgs({data: 'c'}, schemeString), {data: 'c'});
+            should.deepEqual(common.validateArgs({data: 'aa'}, schemeString), false);
+            should.deepEqual(common.validateArgs({data: 'd'}, schemeString), false);
+            should.deepEqual(common.validateArgs({data: ['a']}, schemeArray), {data: ['a']});
+            should.deepEqual(common.validateArgs({data: ['b']}, schemeArray), {data: ['b']});
+            should.deepEqual(common.validateArgs({data: ['c']}, schemeArray), {data: ['c']});
+            should.deepEqual(common.validateArgs({data: ['c', 'a']}, schemeArray), {data: ['c', 'a']});
+            should.deepEqual(common.validateArgs({data: ['c', 'a', 'a']}, schemeArray), {data: ['c', 'a', 'a']});
+            should.deepEqual(common.validateArgs({data: ['c', 'a', 'd']}, schemeArray), false);
+            should.deepEqual(common.validateArgs({data: ['aa']}, schemeArray), false);
+            should.deepEqual(common.validateArgs({data: ['d']}, schemeArray), false);
+            should.deepEqual(common.validateArgs({data: 'x'}, schemeString, true), {errors: ['Value of data is invalid'], result: false});
+            should.deepEqual(common.validateArgs({data: ['x']}, schemeArray, true), {errors: ['Value of data is invalid'], result: false});
+        });
+
+        it('should validate date', () => {
+            let scheme = {
+                    date: { type: 'Date' },
+                },
+                tsMs = Date.now(),
+                dateMs = new Date(tsMs),
+                strMs = dateMs.toISOString(),
+                tsSec = Math.floor(tsMs / 1000),
+                dateSec = new Date(tsSec * 1000),
+                strSec = dateSec.toISOString();
+
+            should.deepEqual(common.validateArgs({}, scheme), {});
+            should.deepEqual(common.validateArgs({date: null}, scheme), {date: null});
+            should.deepEqual(common.validateArgs({date: undefined}, scheme), {});
+            should.deepEqual(common.validateArgs({date: tsMs}, scheme), {date: dateMs});
+            should.deepEqual(common.validateArgs({date: dateMs}, scheme), {date: dateMs});
+            should.deepEqual(common.validateArgs({date: strMs}, scheme), {date: dateMs});
+            should.deepEqual(common.validateArgs({date: tsSec}, scheme), {date: dateSec});
+            should.deepEqual(common.validateArgs({date: dateSec}, scheme), {date: dateSec});
+            should.deepEqual(common.validateArgs({date: strSec}, scheme), {date: dateSec});
+        });
+
+        it('should validate JSON', () => {
+            let scheme = {
+                json: { type: 'JSON' },
+            };
+
+            should.deepEqual(common.validateArgs({}, scheme), {});
+            should.deepEqual(common.validateArgs({json: null}, scheme), {json: 'null'});
+            should.deepEqual(common.validateArgs({json: undefined}, scheme), {});
+            should.deepEqual(common.validateArgs({json: JSON.stringify({a: true})}, scheme), {json: '{"a":true}'});
+            should.deepEqual(common.validateArgs({json: JSON.stringify([{a: true}])}, scheme), {json: '[{"a":true}]'});
+            should.deepEqual(common.validateArgs({json: {a: true}}, scheme), {json: '{"a":true}'});
+            should.deepEqual(common.validateArgs({json: [{a: true}]}, scheme), {json: '[{"a":true}]'});
+        });
+
+        it('should validate custom', () => {
+            let scheme = {
+                custom: { type: 'String', custom: v => v === 'valid' ? undefined : 'value is invalid' },
+            };
+
+            should.deepEqual(common.validateArgs({}, scheme), {});
+            should.deepEqual(common.validateArgs({json: null}, scheme), {});
+            should.deepEqual(common.validateArgs({custom: 'invalid'}, scheme), false);
+            should.deepEqual(common.validateArgs({custom: 3}, scheme), false);
+            should.deepEqual(common.validateArgs({custom: 'valid'}, scheme), {custom: 'valid'});
+            should.deepEqual(common.validateArgs({custom: 'x'}, scheme, true), {errors: ['value is invalid'], result: false});
+        });
+
+        it('should validate boolean / number strings', () => {
+            let scheme = {
+                boolString: {type: 'BooleanString'},
+                bool: {type: 'Boolean'},
+                intString: {type: 'IntegerString'},
+                num: {type: 'Number'},
+            };
+            should.deepEqual(common.validateArgs({bool: 'true'}, scheme), {bool: 'true'});
+            should.deepEqual(common.validateArgs({boolString: 'true'}, scheme), {boolString: true});
+            should.deepEqual(common.validateArgs({boolString: 'false'}, scheme), {boolString: false});
+            should.deepEqual(common.validateArgs({boolString: 'x'}, scheme), false);
+
+            should.deepEqual(common.validateArgs({num: '2'}, scheme), false);
+            should.deepEqual(common.validateArgs({intString: '2'}, scheme), {intString: 2});
+            should.deepEqual(common.validateArgs({intString: '0'}, scheme), {intString: 0});
+            should.deepEqual(common.validateArgs({intString: 'x'}, scheme), false);
+        });
+
+        it('should validate min/max', () => {
+            let scheme = {
+                str: { type: 'String', min: 'c', max: 'f' },
+                num: { type: 'Number', min: 5, max: 10 },
+            };
+
+            should.deepEqual(common.validateArgs({}, scheme), {});
+            should.deepEqual(common.validateArgs({str: null, num: null}, scheme), false);
+            should.deepEqual(common.validateArgs({str: 'asd'}, scheme), false);
+            should.deepEqual(common.validateArgs({str: 'c'}, scheme), {str: 'c'});
+            should.deepEqual(common.validateArgs({str: 'ca'}, scheme), {str: 'ca'});
+            should.deepEqual(common.validateArgs({str: 'd'}, scheme), {str: 'd'});
+            should.deepEqual(common.validateArgs({str: 'f'}, scheme), {str: 'f'});
+            should.deepEqual(common.validateArgs({str: 'g'}, scheme), false);
+            should.deepEqual(common.validateArgs({num: 0}, scheme), false);
+            should.deepEqual(common.validateArgs({num: 5}, scheme), {num: 5});
+            should.deepEqual(common.validateArgs({num: 6}, scheme), {num: 6});
+            should.deepEqual(common.validateArgs({num: 10}, scheme), {num: 10});
+            should.deepEqual(common.validateArgs({num: 11}, scheme), false);
+        });
+
+        it('should validate nonempty', () => {
+            let scheme = {
+                obj: { type: 'Object', nonempty: true },
+                objarr: { type: 'Object[]', nonempty: true },
+                inner: {
+                    type: {
+                        str: {type: 'String'}
+                    },
+                    nonempty: true
+                },
+                innerarr: {
+                    type: {
+                        str: {type: 'String'}
+                    },
+                    array: true,
+                    nonempty: true
+                },
+                innernonemptyarr: {
+                    type: {
+                        str: 'String',
+                    },
+                    array: true,
+                    nonempty: true
+                },
+                json: {
+                    type: 'JSON',
+                    nonempty: true
+                },
+                jsonarr: {
+                    type: 'JSON[]',
+                    nonempty: true
+                },
+            };
+
+            should.deepEqual(common.validateArgs({}, scheme), {});
+            should.deepEqual(common.validateArgs({obj: {}}, scheme), false);
+            should.deepEqual(common.validateArgs({obj: ['1']}, scheme), false);
+            should.deepEqual(common.validateArgs({obj: []}, scheme), false);
+            should.deepEqual(common.validateArgs({obj: {x: 1}}, scheme), {obj: {x: 1}});
+
+            should.deepEqual(common.validateArgs({objarr: []}, scheme), false);
+            should.deepEqual(common.validateArgs({objarr: [{}]}, scheme), false);
+            should.deepEqual(common.validateArgs({objarr: [{a: 1}]}, scheme), {objarr: [{a: 1}]});
+            should.deepEqual(common.validateArgs({objarr: [{}, {a: 1}]}, scheme), false);
+            should.deepEqual(common.validateArgs({objarr: [{b: 1}, {a: 1}]}, scheme), {objarr: [{b: 1}, {a: 1}]});
+
+            should.deepEqual(common.validateArgs({inner: {}}, scheme), false);
+            should.deepEqual(common.validateArgs({inner: {x: 1}}, scheme), {inner: {x: 1}});
+            should.deepEqual(common.validateArgs({inner: {str: 'str'}}, scheme), {inner: {str: 'str'}});
+
+            should.deepEqual(common.validateArgs({innerarr: {}}, scheme), false);
+            should.deepEqual(common.validateArgs({innerarr: [{}]}, scheme), false);
+            should.deepEqual(common.validateArgs({innerarr: [{x: 1}]}, scheme), {innerarr: [{x: 1}]});
+            should.deepEqual(common.validateArgs({innerarr: [{x: 1}, {}]}, scheme), false);
+            should.deepEqual(common.validateArgs({innerarr: [{x: 1}, {y: 2}]}, scheme), {innerarr: [{x: 1}, {y: 2}]});
+            should.deepEqual(common.validateArgs({innerarr: [{str: 'str'}]}, scheme), {innerarr: [{str: 'str'}]});
+
+            should.deepEqual(common.validateArgs({json: '{}'}, scheme), false);
+            should.deepEqual(common.validateArgs({json: '[]'}, scheme), false);
+            should.deepEqual(common.validateArgs({json: '{"x": 1}'}, scheme), {json: '{"x":1}'});
+            should.deepEqual(common.validateArgs({json: '{"str": "str"}'}, scheme), {json: '{"str":"str"}'});
+            should.deepEqual(common.validateArgs({json: '["a"]'}, scheme), {json: '["a"]'});
+
+            should.deepEqual(common.validateArgs({jsonarr: []}, scheme), false);
+            should.deepEqual(common.validateArgs({jsonarr: ['{}']}, scheme), false);
+            should.deepEqual(common.validateArgs({jsonarr: ['{"x":1}']}, scheme), {jsonarr: ['{"x":1}']});
+            should.deepEqual(common.validateArgs({jsonarr: ['{}', '{"x":1}']}, scheme), false);
+            should.deepEqual(common.validateArgs({jsonarr: ['{"x":1}', '{}']}, scheme), false);
+            should.deepEqual(common.validateArgs({jsonarr: ['{"x":1}', '{"y": 2}']}, scheme), {jsonarr: ['{"x":1}', '{"y":2}']});
+
+        });
+    });
+
+    describe('Parsing app version', () => {
+        it('should not parse invalid semver', () => {
+            should.deepEqual(common.parseAppVersion('abcd'), { original: 'abcd', success: false });
+        });
+
+        it('should parse semver into its parts', () => {
+            should.deepEqual(common.parseAppVersion('1.0.0'), {
+                major: 1,
+                minor: 0,
+                patch: 0,
+                prerelease: [],
+                build: [],
+                original: '1.0.0',
+                success: true,
+            });
+        });
+
+        it('should coerce incomplete semver', () => {
+            should.deepEqual(common.parseAppVersion('1'), {
+                major: 1,
+                minor: 0,
+                patch: 0,
+                prerelease: [],
+                build: [],
+                original: '1',
+                success: true,
+            });
+        });
+
+        it('should parse semver prerelease', () => {
+            should.deepEqual(common.parseAppVersion('1.0.0-prerelease'), {
+                major: 1,
+                minor: 0,
+                patch: 0,
+                prerelease: ['prerelease'],
+                build: [],
+                original: '1.0.0-prerelease',
+                success: true,
+            });
+        });
+
+        it('should parse semver build', () => {
+            should.deepEqual(common.parseAppVersion('1.0.0+build'), {
+                major: 1,
+                minor: 0,
+                patch: 0,
+                prerelease: [],
+                build: ['build'],
+                original: '1.0.0+build',
+                success: true,
+            });
+        });
+
+        it('should parse semver prerelease and build', () => {
+            should.deepEqual(common.parseAppVersion('1.0.0-prerelease+build'), {
+                major: 1,
+                minor: 0,
+                patch: 0,
+                prerelease: ['prerelease'],
+                build: ['build'],
+                original: '1.0.0-prerelease+build',
+                success: true,
+            });
+        });
+    });
+
+    describe("getAppUserId", function() {
+        var crypto = require("crypto");
+        var deviceId = "device-123";
+        /**
+        * Legacy derivation that existing app user ids were created with.
+        * @param {string} key - value used as the identity input
+        * @returns {string} sha1 hex id
+        */
+        function legacyId(key) {
+            return crypto.createHash("sha1").update(key + deviceId + "").digest("hex");
+        }
+
+        it("falls back to the app key when id_key is absent (no migration)", function() {
+            var app = { key: "appkey_AAAA" };
+            common.getAppUserId(app, deviceId).should.equal(legacyId("appkey_AAAA"));
+        });
+
+        it("produces the same id as the previous inline derivation", function() {
+            // guarantees existing app_users documents keep matching
+            var key = "1f2e3d4c5b6a7980abcdef0123456789abcdef01";
+            common.getAppUserId({ key: key }, deviceId).should.equal(legacyId(key));
+        });
+
+        it("uses id_key when present", function() {
+            var app = { key: "newkey_BBBB", id_key: "oldkey_AAAA" };
+            common.getAppUserId(app, deviceId).should.equal(legacyId("oldkey_AAAA"));
+        });
+
+        it("keeps the id stable across an app key rotation", function() {
+            var before = { key: "originalkey" };
+            // simulate the freeze-on-update: id_key captures the old key, then key rotates
+            var after = { key: "rotatedkey", id_key: "originalkey" };
+            common.getAppUserId(after, deviceId).should.equal(common.getAppUserId(before, deviceId));
+        });
+
+        it("prefers id_key over key when both are set", function() {
+            common.getAppUserId({ key: "k", id_key: "i" }, deviceId)
+                .should.not.equal(common.getAppUserId({ key: "k" }, deviceId));
+        });
+    });
+
+    describe("findUnsafeMongoOperator", function() {
+        it("returns null for a clean query", function() {
+            should.equal(common.findUnsafeMongoOperator({ lac: { $lt: 1777320900 } }), null);
+            should.equal(common.findUnsafeMongoOperator({}), null);
+            should.equal(common.findUnsafeMongoOperator({ uid: { $in: ["1", "2"] } }), null);
+        });
+        it("detects the JS-execution operators at the top level", function() {
+            common.findUnsafeMongoOperator({ $where: "1==1" }).should.equal("$where");
+            common.findUnsafeMongoOperator({ $function: {} }).should.equal("$function");
+            common.findUnsafeMongoOperator({ $accumulator: {} }).should.equal("$accumulator");
+        });
+        it("detects operators nested at any depth (arrays, $and)", function() {
+            common.findUnsafeMongoOperator({ $and: [{ uid: { $ne: null } }, { $where: "x" }] }).should.equal("$where");
+        });
+        it("allows $expr but still detects a JS operator wrapped inside it", function() {
+            // $expr alone is permitted (no JS execution)
+            should.equal(common.findUnsafeMongoOperator({ $expr: { $lt: ["$lac", 1777320900] } }), null);
+            // but a $function nested inside $expr is still caught
+            common.findUnsafeMongoOperator({ $expr: { $function: { body: "...", lang: "js" } } }).should.equal("$function");
+        });
+        it("inspects keys only, not values (no false positive on string values)", function() {
+            should.equal(common.findUnsafeMongoOperator({ note: "see the $where docs" }), null);
+            should.equal(common.findUnsafeMongoOperator({ url: { $eq: "http://x/$function" } }), null);
+        });
+    });
+
+    describe("parseUserQuery", function() {
+        it("parses a JSON string into an object", function() {
+            var r = common.parseUserQuery('{"uid":{"$in":["1"]}}');
+            should.not.exist(r.error);
+            r.query.should.eql({ uid: { $in: ["1"] } });
+        });
+        it("treats empty / null / undefined as an empty query", function() {
+            common.parseUserQuery("").query.should.eql({});
+            common.parseUserQuery(null).query.should.eql({});
+            common.parseUserQuery(undefined).query.should.eql({});
+        });
+        it("rejects invalid JSON", function() {
+            common.parseUserQuery("{not json").error.should.equal("Invalid query JSON");
+        });
+        it("rejects non-object JSON values (arrays, scalars)", function() {
+            common.parseUserQuery("[]").error.should.equal("Query must be an object");
+            common.parseUserQuery("[{}]").error.should.equal("Query must be an object");
+            common.parseUserQuery([]).error.should.equal("Query must be an object");
+            common.parseUserQuery("5").error.should.equal("Query must be an object");
+        });
+        it("rejects pathologically deep nesting instead of overflowing the stack", function() {
+            var deep = {};
+            var cur = deep;
+            for (var i = 0; i < 5000; i++) {
+                cur.a = {};
+                cur = cur.a;
+            }
+            common.parseUserQuery(deep).error.should.equal("Query is nested too deeply");
+        });
+        it("accepts an already-parsed object", function() {
+            var r = common.parseUserQuery({ lac: { $lt: 1 } });
+            should.not.exist(r.error);
+            r.query.should.eql({ lac: { $lt: 1 } });
+        });
+        it("rejects a disallowed operator with the operator name", function() {
+            common.parseUserQuery('{"$where":"1==1"}').error.should.equal("Query contains disallowed operator: $where");
+        });
+        it("cannot be evaded by JSON unicode-escaping the operator key", function() {
+            // \\u0024 decodes to '$' — JSON.parse yields a real {$where:...} key
+            common.parseUserQuery('{"\\u0024where":"sleep(5000)||true"}').error.should.equal("Query contains disallowed operator: $where");
+        });
+        it("allows a legitimate $expr query over multiple timestamp fields", function() {
+            var q = '{"$and":[{"$expr":{"$lt":[{"$max":["$ls","$lac","$last_sync"]},1777320900]}},{"uid":{"$ne":null}}]}';
+            var r = common.parseUserQuery(q);
+            should.not.exist(r.error);
+            r.query.$and.length.should.equal(2);
+        });
+        it("rejects a JS operator wrapped in $expr", function() {
+            common.parseUserQuery('{"$expr":{"$function":{"body":"x","lang":"js"}}}').error
+                .should.equal("Query contains disallowed operator: $function");
+        });
+    });
+});
+
+// The export path and the DB Viewer both hand a caller supplied projection to find(), and
+// MongoDB 4.4 and later evaluate aggregation expressions there. An expression can rename a
+// field, which defeats redaction that works by field name, or run javascript in the database
+// with $function. Only plain include and exclude survive.
+describe('common.sanitizeProjection', function() {
+    it('keeps plain include and exclude', function() {
+        var p = {email: 1, full_name: 1, password: 0, api_key: false, name: true};
+        common.sanitizeProjection(p);
+        p.should.eql({email: 1, full_name: 1, password: 0, api_key: false, name: true});
+    });
+
+    it('drops a field path alias, which is how a redacted field gets renamed', function() {
+        var p = {pw: '$password', ak: '$api_key', tfa: '$two_factor_auth', email: 1};
+        var dropped = common.sanitizeProjection(p);
+        p.should.eql({email: 1});
+        Object.keys(dropped).sort().should.eql(['ak', 'pw', 'tfa']);
+    });
+
+    it('drops a nested field path alias', function() {
+        var p = {secret: '$two_factor_auth.secret_token'};
+        common.sanitizeProjection(p);
+        p.should.eql({});
+    });
+
+    it('drops expressions, including ones that would run javascript', function() {
+        var p = {
+            joined: {$concat: ['$password', '$api_key']},
+            js: {$function: {body: 'function(v){ return v; }', args: ['$password'], lang: 'js'}},
+            picked: {$cond: [true, '$api_key', 'no']}
+        };
+        common.sanitizeProjection(p);
+        p.should.eql({});
+    });
+
+    it('drops values that are not valid include or exclude', function() {
+        var p = {a: 2, b: NaN, c: 'yes', d: null, e: [1]};
+        common.sanitizeProjection(p);
+        p.should.eql({});
+    });
+
+    it('leaves a missing or non object projection alone', function() {
+        should.not.exist(common.sanitizeProjection(undefined).undefined);
+        Object.keys(common.sanitizeProjection(null)).should.eql([]);
+        Object.keys(common.sanitizeProjection('string')).should.eql([]);
+        Object.keys(common.sanitizeProjection([1, 2])).should.eql([]);
+    });
+});

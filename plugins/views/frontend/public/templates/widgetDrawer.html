@@ -1,0 +1,10 @@
+<div>
+    <clyd-datatype v-model="scope.editedObject.data_type" @change="onDataTypeChange"></clyd-datatype>
+    <clyd-sourceapps v-model="scope.editedObject.apps" :multiple="false"></clyd-sourceapps>
+    <clyd-visualization v-model="scope.editedObject.visualization" :enabled-types="['table']"></clyd-visualization>
+    <clyd-metric v-model="scope.editedObject.metrics" :metrics="availableStatsMetric" :multiple="true"></clyd-metric>
+    <cly-form-field-group :label="i18n('dashboards.additional-settings')">
+        <clyd-title v-model="scope.editedObject.title"></clyd-title>
+	    <clyd-period :disabled-shortcuts="['0days']" v-model="scope.editedObject.custom_period"></clyd-period>
+    </cly-form-field-group>
+</div>

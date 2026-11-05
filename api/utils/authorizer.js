@@ -1,0 +1,598 @@
+/**
+* Module providing one time authentication
+* @module api/utils/authorizer
+*/
+
+/** @lends module:api/utils/authorizer */
+var authorizer = {};
+var common = require("./common.js");
+var crypto = require("crypto");
+const log = require('./log.js')('core:authorizer');
+
+
+/**
+* Store token for later authentication
+* @param {object} options - options for the task
+* @param {object} options.db - database connection
+* @param {number} options.ttl - amount of seconds for token to work, 0 works indefinately
+* @param {boolean} [options.multi=false] - if true, can be used many times until expired
+* @param {string} options.token - token to store, if not provided, will be generated
+* @param {string} options.owner - id of the user who created this token
+* @param {string} options.app - list of the apps for which token was created
+* @param {string} options.endpoint - regexp of endpoint(any string - is used as substring,to mach exact ^{yourpath}$). Deprecated as an authorization mechanism, kept for tokens created before the permission model.
+* @param {object} [options.token_permission] - CRUD permissions granted to this token, in the same shape as member.permission ({_:{a,u}, c/r/u/d:{appId:{all, allowed}}}). When set, the token authorizes only the intersection of this object and its owner's own permissions. When omitted, the token inherits the owner's full permissions.
+* @param {boolean} [options.can_login=false] - if true, the token may be redeemed for a dashboard session at /login/token. SERVER-ASSIGNED ONLY - see the note below.
+* @param {string} options.tryReuse - if true - tries to find not expired token with same parameters. If not founds cretes new token. If found - updates token expiration time to new one and returns token.
+* @param {boolean} [options.temporary=false] - If logged in with temporary token. Doesn't kill other sessions on logout.
+* @param {Function} options.callback - function called when saving was completed or errored, providing error object as first param and token string as second
+*/
+authorizer.save = function(options) {
+    options.db = options.db || common.db;
+    options.token = options.token || authorizer.getToken();
+    options.ttl = options.ttl || 0;
+    options.multi = options.multi || false;
+    options.app = options.app || "";
+    options.endpoint = options.endpoint || "";
+    options.purpose = options.purpose || "";
+    options.temporary = options.temporary || false; //If logged in with temporary token. Doesn't kill other sessions on logout
+
+    // Login capability is a property of the token, never of its purpose string. It is set only
+    // where the server itself establishes or propagates a session (setLoggedInVariables, the
+    // renderer, the ban-warning mail, OIDC login), and by /i/token/create only when the creating
+    // credential already holds it. Defaulting to false here means any caller that does not ask
+    // for it explicitly produces a token that cannot be redeemed at /login/token.
+    options.can_login = options.can_login === true;
+
+    if (options.endpoint !== "" && !Array.isArray(options.endpoint)) {
+        options.endpoint = [options.endpoint];
+    }
+
+    if (options.app !== "" && !Array.isArray(options.app)) {
+        options.app = [options.app];
+    }
+
+    if (options.owner && options.owner !== "") {
+        options.owner = options.owner + "";
+        options.db.collection('members').findOne({'_id': options.db.ObjectID(options.owner)}, function(err, member) {
+            if (err) {
+                if (typeof options.callback === "function") {
+                    options.callback(err, "");
+                    return;
+                }
+            }
+            else if (member) {
+                authorizer.clearExpiredTokens(options);
+                /**
+                * Build the token document to store. token_permission is only written when the
+                * token is actually scoped, so an unscoped token stays absent-means-unrestricted.
+                * @returns {object} document to insert into auth_tokens
+                */
+                var buildTokenDoc = function() {
+                    var ends = options.ttl + Math.round(Date.now() / 1000);
+                    // A caller bounding this token by another credential's lifetime passes that
+                    // credential's absolute end. The cap is applied here, at insertion, rather than
+                    // by the caller turning it into a relative ttl: the member lookup above is
+                    // asynchronous, so a ttl computed before it would land ends later than the
+                    // bound by however long the lookup took.
+                    if (options.maxEnds > 0 && options.ttl > 0 && ends > options.maxEnds) {
+                        ends = options.maxEnds;
+                    }
+                    var doc = {
+                        _id: options.token,
+                        ttl: options.ttl,
+                        ends: ends,
+                        multi: options.multi,
+                        owner: options.owner,
+                        app: options.app,
+                        endpoint: options.endpoint,
+                        purpose: options.purpose,
+                        temporary: options.temporary,
+                        can_login: options.can_login
+                    };
+                    if (options.token_permission) {
+                        doc.token_permission = options.token_permission;
+                    }
+                    if (options.maxEnds > 0) {
+                        // kept on the document so that extend_token can honour it: the bound is
+                        // a property of this token for its whole life, not of the insert alone
+                        doc.max_ends = options.maxEnds;
+                    }
+                    return doc;
+                };
+                if (options.tryReuse === true) {
+                    var rules = {"multi": options.multi, "endpoint": options.endpoint, "app": options.app, "owner": options.owner, "purpose": options.purpose, "can_login": options.can_login};
+                    // Never reuse a token that grants something different from what is being asked
+                    // for: an identical-looking token with a wider (or narrower) permission set is a
+                    // different credential.
+                    if (options.token_permission) {
+                        rules.token_permission = options.token_permission;
+                    }
+                    else {
+                        rules.token_permission = {$exists: false};
+                    }
+                    if (options.purpose === "LoggedInAuth") {
+                        //Login token, allow switching from expiring to not expiring(and other way around)
+                        //If there is changes to session expiration - this will allow to treat those tokens as same token.
+                        rules.$or = [{"ttl": 0}, {"ttl": {"$gt": 0}, "ends": {$gt: Math.round(Date.now() / 1000)}}];
+                    }
+                    else {
+                        if (options.ttl > 0) {
+                            rules.ttl = {$gt: 0};
+                            rules.ends = {$gt: Math.round(Date.now() / 1000)};
+                        }
+                        else {
+                            rules.ttl = options.ttl;
+                        }
+                    }
+
+
+                    var setObj = {ttl: options.ttl};
+                    setObj.ends = options.ttl + Math.round(Date.now() / 1000);
+                    options.db.collection("auth_tokens").findAndModify(rules, {}, {$set: setObj}, function(err_token, token) {
+                        if (token && token.value) {
+                            options.callback(err_token, token.value._id);
+                        }
+                        else {
+                            options.db.collection("auth_tokens").insert(buildTokenDoc(), function(err1) {
+                                if (typeof options.callback === "function") {
+                                    options.callback(err1, options.token);
+                                }
+                            });
+                        }
+                    });
+                }
+                else {
+                    options.db.collection("auth_tokens").insert(buildTokenDoc(), function(err1) {
+                        if (typeof options.callback === "function") {
+                            options.callback(err1, options.token);
+                        }
+                    });
+                }
+            }
+            else {
+                if (typeof options.callback === "function") {
+                    options.callback("Token must have owner. Please provide correct user id", "");
+                }
+            }
+        });
+    }
+    else {
+        if (typeof options.callback === "function") {
+            options.callback("Token must have owner. Please provide correct user id", "");
+        }
+    }
+};
+
+/**
+* Get whole token information from database
+* @param {object} options - options for the task
+* @param {object} options.db - database connection
+* @param {string} options.token - token to read
+* @param {Function} options.callback - function called when reading was completed or errored, providing error object as first param and token object from database as second
+*/
+authorizer.read = function(options) {
+    options.db = options.db || common.db;
+    if (!options.token || options.token === "") {
+        options.callback(Error('Token not given'), null);
+    }
+    else {
+        options.token = options.token + "";
+        options.db.collection("auth_tokens").findOne({_id: options.token}, options.callback);
+    }
+};
+
+
+authorizer.clearExpiredTokens = function(options) {
+    var ends = Math.round(Date.now() / 1000);
+    options.db.collection("auth_tokens").remove({ttl: {$gt: 0}, ends: {$lt: ends}});
+};
+
+/**
+* Checks if token is not expired yet
+* @param {object} options - options for the task
+* @param {object} options.db - database connection
+* @param {string} options.token - token to rvalidate
+* @param {Function} options.callback - function called when reading was completed or errored, providing error object as first param, true or false if expired as second, seconds till expiration as third.(-1 if never expires, 0 - if expired) 
+*/
+authorizer.check_if_expired = function(options) {
+    options.db = options.db || common.db;
+    options.token = options.token + "";
+    options.db.collection("auth_tokens").findOne({_id: options.token}, function(err, res) {
+        var expires_after = 0;
+        var valid = false;
+        if (res) {
+            if (res.ttl > 0 && res.ends >= Math.round(Date.now() / 1000)) {
+                valid = true;
+                expires_after = res.ends - Math.round(Date.now() / 1000);
+            }
+            else if (res.ttl === 0) {
+                valid = true;
+                expires_after = -1;
+            }
+        }
+        options.callback(err, valid, expires_after);
+    });
+};
+
+/**
+* extent token life spas
+* @param {object} options - options for the task
+* @param {object} options.db - database connection
+* @param {string} options.token - token to extend
+* @param {string} options.extendBy - extend token by given time(in ms)(optional) You have to provide extedBy or extendTill. extendBy==0 makes it never die
+* @param {string} options.extendTill - extend till given timestamp. (optional) You have to provide extedBy or extendTill
+* @param {Function} options.callback - function called when reading was completed or errored, providing error object as first param and true as second if extending successful
+*/
+authorizer.extend_token = function(options) {
+    if (!options.token || options.token === "") {
+        if (typeof options.callback === "function") {
+            options.callback(Error("Token not provided"), null);
+        }
+        return;
+    }
+    options.token = options.token + "";
+    options.db = options.db || common.db;
+    var updateArr = {
+        ttl: 0,
+        ends: 0
+    };
+    if (options.extendBy) {
+        updateArr.ends = Math.round((options.extendBy + Date.now()) / 1000);
+        updateArr.ttl = options.extendBy;
+    }
+    else if (options.extendTill) {
+        updateArr.ends = Math.round(options.extendTill / 1000);
+        updateArr.ttl = 1;
+    }
+    else {
+        if (typeof options.callback === "function") {
+            options.callback(Error("Please provide extendTill or extendBy"), null);
+        }
+        return;
+    }
+    // A token bounded by another credential's lifetime carries max_ends. An extension - the
+    // heatmap route extends a token by ten minutes whenever it is close to expiry - must not
+    // carry it past that bound, or repeated requests keep a scoped child alive indefinitely
+    // after its parent expired. Read the document first; a token with no bound extends as
+    // before.
+    options.db.collection("auth_tokens").findOne({_id: options.token}, {projection: {max_ends: 1}}, function(readErr, doc) {
+        if (readErr) {
+            // fail closed: without the bound there is no safe extension to write
+            if (typeof options.callback === "function") {
+                options.callback(readErr, null);
+            }
+            return;
+        }
+        if (doc && doc.max_ends > 0 && updateArr.ends > doc.max_ends) {
+            updateArr.ends = doc.max_ends;
+            updateArr.ttl = Math.max(1, doc.max_ends - Math.round(Date.now() / 1000));
+        }
+        options.db.collection("auth_tokens").update({_id: options.token}, {$set: updateArr}, function(err) {
+            if (typeof options.callback === "function") {
+                options.callback(err, true);
+            }
+        });
+    });
+};
+var ENDPOINT_SEGMENT = /^[A-Za-z0-9_-]+$/;
+/**
+* Whether a value is a literal API path a new token may be restricted to: a leading slash and at
+* least two non-empty segments of letters, digits, "_" and "-". Nothing else, so no regex syntax,
+* no wildcard and no path that covers a whole tree ("/", "/o").
+* @param {string} path - requested endpoint
+* @returns {boolean} true if it is a literal API path
+*/
+function isLiteralEndpointPath(path) {
+    if (typeof path !== "string" || path.charAt(0) !== "/") {
+        return false;
+    }
+    var segments = path.slice(1).split("/");
+    return segments.length >= 2 && segments.every(function(segment) {
+        return ENDPOINT_SEGMENT.test(segment);
+    });
+}
+/**
+* A literal query string key and value an endpointquery entry may require.
+*/
+var ENDPOINT_PARAM_KEY = /^[A-Za-z0-9_]+$/;
+var ENDPOINT_PARAM_VALUE = /^[A-Za-z0-9_-]+$/;
+
+/**
+* Parse the endpoint restriction a request asks a new token to carry.
+*
+* Stored endpoints are regexes matched from the start of the request path, so a value such as
+* "", "/o" or ".*" would cover every path or a whole tree. A new token therefore names concrete
+* paths only, and each is stored anchored at both ends, so "/o/actions" matches /o/actions and
+* nothing else. An endpointquery entry is validated the same way, and the query string values
+* it requires are matched exactly. Tokens stored before keep their own matching.
+* @param {string|undefined} endpointParam - comma separated paths (the endpoint parameter)
+* @param {string|undefined} endpointQueryParam - JSON array of {endpoint, params} (the endpointquery parameter)
+* @returns {{endpoint: (Array|string), error: (string|undefined)}} the endpoint field to store ("" for none), or an error
+*/
+function parseEndpointRestriction(endpointParam, endpointQueryParam) {
+    var hasEndpoint = typeof endpointParam !== "undefined" && endpointParam !== null;
+    var hasQuery = typeof endpointQueryParam !== "undefined" && endpointQueryParam !== null;
+    if (!hasEndpoint && !hasQuery) {
+        return {endpoint: ""};
+    }
+    if (hasEndpoint && hasQuery) {
+        return {error: "Use either endpoint or endpointquery, not both"};
+    }
+    if (hasEndpoint) {
+        if (typeof endpointParam !== "string") {
+            return {error: "Invalid endpoint"};
+        }
+        var paths = endpointParam.split(",");
+        for (var i = 0; i < paths.length; i++) {
+            if (!isLiteralEndpointPath(paths[i])) {
+                return {error: "Invalid endpoint"};
+            }
+        }
+        var anchored = paths.map(function(path) {
+            return "^" + path + "$";
+        });
+        return {endpoint: anchored};
+    }
+    var entries;
+    try {
+        entries = typeof endpointQueryParam === "string" ? JSON.parse(endpointQueryParam) : endpointQueryParam;
+    }
+    catch {
+        return {error: "Invalid endpointquery"};
+    }
+    if (!Array.isArray(entries) || entries.length === 0) {
+        return {error: "Invalid endpointquery"};
+    }
+    var stored = [];
+    for (var e = 0; e < entries.length; e++) {
+        var entry = entries[e];
+        if (!entry || typeof entry !== "object" || Array.isArray(entry) || !isLiteralEndpointPath(entry.endpoint)) {
+            return {error: "Invalid endpointquery"};
+        }
+        var requiredParams = {};
+        if (typeof entry.params !== "undefined") {
+            if (!entry.params || typeof entry.params !== "object" || Array.isArray(entry.params)) {
+                return {error: "Invalid endpointquery"};
+            }
+            for (var key in entry.params) {
+                if (!ENDPOINT_PARAM_KEY.test(key) || typeof entry.params[key] !== "string" || !ENDPOINT_PARAM_VALUE.test(entry.params[key])) {
+                    return {error: "Invalid endpointquery"};
+                }
+                requiredParams[key] = "^" + entry.params[key] + "$";
+            }
+        }
+        stored.push({endpoint: "^" + entry.endpoint + "$", params: requiredParams});
+    }
+    return {endpoint: stored};
+}
+
+/**
+* Token validation function called from verify and verify return
+* @param {object} options - options for the task
+* @param {object} options.db - database connection
+* @param {string} options.token - token to validate
+* @param {string} options.qstring - params.qstring. If not passed and there is limitation for this token on params - token will not be valid
+* @param {Function} options.callback - function called when verifying was completed or errored, providing error object as first param and true as second if extending successful
+* @param {boolean} return_owner states if in callback owner shold be returned. If return_owner==false, returns true or false.
+* @param {boolean} return_data states if in callback all token data should be returned.
+*/
+var verify_token = function(options, return_owner, return_data) {
+    options.db = options.db || common.db;
+    if (!options.token || options.token === "") {
+        if (typeof options.callback === "function") {
+            options.callback(false);
+        }
+        return;
+    }
+    else {
+        options.token = options.token + "";
+        options.db.collection("auth_tokens").findOne({_id: options.token}, function(err, res) {
+            var valid = false;
+            var expires_after = 0;
+            if (res) {
+                var valid_endpoint = true;
+                if (Array.isArray(res.endpoint) && res.endpoint.length === 0) {
+                    res.endpoint = "";
+                }
+                // The endpoint restriction limits which paths a token can call. A token that also
+                // carries token_permission is held to both: the paths here, and the permissions
+                // rights.js intersects with its owner's on every request.
+                if (res.endpoint && res.endpoint !== "") {
+                    //keep backwards compability
+                    if (!Array.isArray(res.endpoint)) {
+                        res.endpoint = [res.endpoint];
+                    }
+                    valid_endpoint = false;
+                    if (options.req_path !== "") {
+                        var my_regexp = "";
+                        for (var p = 0; p < res.endpoint.length; p++) {
+                            if (res.endpoint[p] && res.endpoint[p].endpoint) {
+                                var missing_param = false;
+                                if (res.endpoint[p].params) {
+                                    for (var k in res.endpoint[p].params) {
+                                        try {
+                                            var my_regexp2 = new RegExp(res.endpoint[p].params[k]);
+                                            if (!options.qstring || !options.qstring[k] || !my_regexp2.test(options.qstring[k])) {
+                                                missing_param = true;
+                                            }
+                                        }
+                                        catch {
+                                            log.e("Invalid regex: '" + res.endpoint[p].params[k] + "'");
+                                            missing_param = true;
+                                        }
+                                    }
+                                }
+                                try {
+                                    my_regexp = new RegExp(res.endpoint[p].endpoint);
+                                    if (!missing_param && my_regexp.test(options.req_path)) {
+                                        valid_endpoint = true;
+                                    }
+                                }
+                                catch {
+                                    log.e("Invalid regex: '" + res.endpoint[p].endpoint + "'");
+                                }
+                            }
+                            else {
+                                try {
+                                    my_regexp = new RegExp(res.endpoint[p]);
+                                    if (my_regexp.test(options.req_path)) {
+                                        valid_endpoint = true;
+                                    }
+                                }
+                                catch {
+                                    log.e("Invalid regex: '" + res.endpoint[p] + "'");
+                                }
+                            }
+                        }
+                    }
+                }
+                var valid_app = true;
+                if (res.app && res.app !== "") {
+                    //keep backwards compability
+                    if (!Array.isArray(res.app)) {
+                        res.app = [res.app];
+                    }
+                    if (options.qstring && options.qstring.app_id) {
+                        if (res.app.indexOf(options.qstring.app_id) === -1) {
+                            valid_app = false;
+                        }
+                    }
+                }
+
+                // The bound a scoped parent put on this token is absolute. It is applied wherever
+                // ends is written, but a writer that does not know about it - a session-timeout
+                // change retimes every LoggedInAuth token of a member in one update - must not be
+                // able to move the token past it either, so it is enforced here, at every use.
+                var pastBound = res.max_ends > 0 && res.max_ends < Math.round(Date.now() / 1000);
+                if (valid_endpoint && valid_app) {
+                    if (pastBound) {
+                        // expired by its bound: neither branch below may mark it valid, and the
+                        // consume step at the end removes it like any other expired token
+                    }
+                    else if (res.ttl === 0) {
+                        valid = true;
+                        expires_after = -1;
+                        if (return_owner) {
+                            valid = res.owner;
+                        }
+                        else if (return_data) {
+                            valid = res;
+                        }
+                    }
+                    else if (res.ends >= Math.round(Date.now() / 1000)) {
+                        valid = true;
+                        expires_after = Math.max(0, res.ends - Math.round(Date.now() / 1000));
+                        if (return_owner) {
+                            valid = res.owner;
+                        }
+                        else if (return_data) {
+                            valid = res;
+                        }
+                    }
+
+                    //consume token if expired or not multi
+                    if (!res.multi || (res.ttl > 0 && res.ends < Math.round(Date.now() / 1000)) || pastBound) {
+                        if (valid && !res.multi) {
+                            // A single use token is valid only for the request that removes it. The
+                            // read above is not a claim: requests arriving together all find the
+                            // document before any of them deletes it, so each would pass. The delete
+                            // is the claim instead, and only the caller whose delete removed the
+                            // document gets the token.
+                            options.db.collection("auth_tokens").deleteOne({_id: options.token}, {}, function(errDelete, deleted) {
+                                if (errDelete || !deleted || deleted.deletedCount !== 1) {
+                                    valid = false;
+                                    expires_after = 0;
+                                }
+                                if (typeof options.callback === "function") {
+                                    options.callback(valid, expires_after);
+                                }
+                            });
+                            return;
+                        }
+                        options.db.collection("auth_tokens").remove({_id: options.token});
+                    }
+                }
+            }
+            if (typeof options.callback === "function") {
+                options.callback(valid, expires_after);
+            }
+        });
+    }
+};
+    /**
+* Verify token and expire it
+* @param {object} options - options for the task
+* @param {object} options.db - database connection
+* @param {string} options.token - token to verify
+* @param {string} options.qstring - params.qstring. If not passed and there is limitation for this token on params - token will not be valid
+* @param {string} options.req_path - current request path
+* @param {Function} options.callback - function called when verifying was completed, providing 1 argument, true if could verify token and false if couldn't
+*/
+authorizer.verify = function(options) {
+    verify_token(options, false);
+};
+
+/** 
+* Similar to authorizer.verify. Only difference - return token owner if valid.
+* @param {object} options - options for the task
+* @param {object} options.db - database connection
+* @param {string} options.token - token to verify
+* @param {string} options.qstring - params.qstring. If not passed and there is limitation for this token on params - token will not be valid
+* @param {string} options.req_path - current request path
+* @param {Function} options.callback - function called when verifying was completed, providing 1 argument, true if could verify token and false if couldn't
+*/
+authorizer.verify_return = function(options) {
+    if (options.return_data) {
+        verify_token(options, false, true);
+    }
+    else {
+        verify_token(options, true);
+    }
+};
+/**
+* Generates auhtentication ID
+* @returns {string} id to be used when saving the task
+*/
+authorizer.getToken = function() {
+    return crypto.createHash('sha1').update(crypto.randomBytes(16).toString("hex") + "" + new Date().getTime()).digest('hex');
+};
+
+/**
+* Clean all expired tokens
+* @param {object} options - options for the task
+* @param {object} options.db - database connection
+* @param {Function} options.callback - function called when cleaning completed
+*/
+authorizer.clean = function(options) {
+    options.db = options.db || common.db;
+    options.db.collection("auth_tokens").remove({
+        ends: {$lt: Math.round(Date.now() / 1000)},
+        ttl: {$ne: 0}
+    }, options.callback);
+};
+
+/**
+* Revoke the tokens a member owns. Used when a member signs out (purpose LoggedInAuth only)
+* and when their password changes (every token, of any purpose).
+* The owner is matched as a string, because save() stores it as one.
+* @param {object} options - options for the task
+* @param {object=} options.db - database connection
+* @param {string|object} options.owner - id of the member whose tokens are revoked
+* @param {string=} options.purpose - only revoke tokens with this purpose; every token when omitted
+* @param {string=} options.keepToken - token to keep, such as the one of the current session
+* @returns {Promise} resolves once the tokens are removed
+*/
+authorizer.revokeMemberTokens = async function(options) {
+    var db = options.db || common.db;
+    var query = {owner: options.owner + ''};
+    if (options.purpose) {
+        query.purpose = options.purpose;
+    }
+    if (options.keepToken) {
+        query._id = {$ne: options.keepToken + ''};
+    }
+    await db.collection('auth_tokens').deleteMany(query);
+};
+
+authorizer.parseEndpointRestriction = parseEndpointRestriction;
+module.exports = authorizer;

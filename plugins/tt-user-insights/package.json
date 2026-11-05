@@ -1,0 +1,19 @@
+{
+  "name": "countly-tt-user-insights",
+  "title": "TT User Insights",
+  "version": "1.0.0",
+  "description": "TT Analytics module for user search, profile overview, and human-readable business activity timeline.",
+  "author": "TT Studio",
+  "homepage": "https://countly.com",
+  "license": "Proprietary",
+  "keywords": [
+    "countly",
+    "plugin",
+    "analytics",
+    "user-insights",
+    "timeline",
+    "tt-analytics"
+  ],
+  "dependencies": {}
+}
+

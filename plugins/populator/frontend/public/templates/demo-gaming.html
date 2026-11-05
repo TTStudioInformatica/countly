@@ -1,0 +1,75 @@
+<html>
+    <head>
+        <title>Countly Gaming - Heatmap Demo</title>
+        <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.4.1/css/bootstrap.min.css" integrity="sha384-Vkoo8x4CGsO3+Hhxv8T/Q5PaXtkKtu6ug5TOeNV6gBiFeWPGFN9MuhOf23Q9Ifjh" crossorigin="anonymous">
+        <link rel="stylesheet" href="<%= countlyPath %>/populator/stylesheets/demo/gaming.css">
+    </head>
+    <body>
+        <div class="container demo-gaming">
+            <div class="row top-bar">
+                <div class="col-sm-1">
+                    <a href="demo-gaming-1.html">
+                        Games
+                    </a>
+                </div>
+                <div class="col-sm-1">
+                    Careers
+                </div>
+                <div class="col-sm-8 text-center">
+                    <a href="demo-gaming.html">
+                        Countly Game
+                    </a>
+                </div>
+                <div class="col-sm-1 text-right">
+                    <a href="demo-gaming-2.html">
+                        Community
+                    </a>
+                </div>
+                <div class="col-sm-1 text-right">
+                    Log in
+                </div>
+            </div>
+            <div class="row content">
+                <% if (pageIndex === '0') { %>
+                    <div class="col-sm-4 download-section offset-1 text-center">
+                        <button type="button" class="btn btn-outline-success btn-large">Play Game</button>
+                        <br>
+                        <p class="description">By clicking Play Now you confirm that you accept our Terms of Service and have read our Privacy Policy</p>
+                        <hr>
+                        <img class="download-your-phone-icon" src="<%= countlyPath %>/populator/images/ios.png">
+                        <img class="download-your-phone-icon" src="<%= countlyPath %>/populator/images/android.png">
+                    </div>
+                    <div class="col-sm-4 offset-1 text-center">
+                        <img src="<%= countlyPath %>/populator/images/gaming.svg" style="width:100%">
+                    </div>
+                <% } else if (pageIndex === '1') { %>
+                    <div class="col-sm-12">
+                        <h1>Our Games</h1>
+                        <%- include(includes.content3Cols); %>
+                    </div>
+                <% } else if (pageIndex === '2') { %>
+                    <div class="col-sm-12">
+                        <h1>Our Lovely Community</h1>
+                        <%- include(includes.content2Cols); %>
+                    </div>
+                <% } %>
+            </div>
+            <div class="container row footer">
+                <div class="col-sm">
+                    <a href="demo-gaming-1.html">
+                        Games
+                    </a>
+                </div>
+                <div class="col-sm">
+                    <a href="demo-gaming-2.html">
+                        Community
+                    </a>
+                </div>
+                <div class="col-sm">
+                    Interest-Based Ads
+                </div>
+            </div>
+        </div>
+        <%- include(includes.scripts); %>
+    </body>
+</html>

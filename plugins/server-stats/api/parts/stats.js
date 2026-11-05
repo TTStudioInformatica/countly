@@ -1,0 +1,488 @@
+const moment = require("moment");
+
+const internalEventsEnum =
+    {
+        "[CLY]_session": "s",
+        "[CLY]_view": "v",
+        "[CLY]_nps": "n",
+        "[CLY]_crash": "c",
+        "[CLY]_action": "ac",
+        "[CLY]_survey": "srv",
+        "[CLY]_star_rating": "str",
+        "[CLY]_apm_device": "apm",
+        "[CLY]_apm_network": "apm",
+        "[CLY]_push_action": "p",
+        "[CLY]_push_sent": "ps",
+        "[CLY]_consent": "cs",
+        "[CLY]_llm_interaction": "llm",
+        "[CLY]_llm_interaction_feedback": "llm",
+        "[CLY]_llm_tool_used": "llm",
+        "[CLY]_llm_tool_usage_parameter": "llm",
+    };
+
+/**
+* Saves session and event count information to server_stats_data_points
+* collection in countly database
+
+* Sample document is like below where a is the app id, m is the month,
+* e is event count and s is the session count
+{
+   "_id" : "58496f1c81ccb91a37dbb1d0_2016:12",
+   "a" : "58496f1c81ccb91a37dbb1d0",
+   "m" : "2016:12",
+   "e" : 1898,
+   "s" : 286
+}
+* @param {Object} writeBatcher - writeBatcher instance
+* @param {string} appId - Application Id
+* @param {Number} sessionCount - Session Count
+* @param {Number} eventCount - Event Count
+* @param {boolean} consolidated - If data is consolidated
+* @returns {undefined} Returns nothing
+**/
+function updateDataPoints(writeBatcher, appId, sessionCount, eventCount, consolidated) {
+    if (!sessionCount && !eventCount) {
+        return;
+    }
+    var utcMoment = moment.utc();
+    var incObject = {
+        s: sessionCount,
+        [`d.${utcMoment.format("D")}.${utcMoment.format("H")}.s`]: sessionCount
+    };
+    if (typeof eventCount === 'object' && Object.keys(eventCount).length) {
+        var sum = sessionCount || 0;
+        for (var key in eventCount) {
+            incObject[key] = eventCount[key];
+            incObject[`d.${utcMoment.format("D")}.${utcMoment.format("H")}.${key}`] = eventCount[key];
+            // sum += eventCount[key] || 0;
+            if (key === "e" || key === "s") { //because other are breakdowns from events.
+                sum += eventCount[key] || 0;
+            }
+        }
+        incObject[`d.${utcMoment.format("D")}.${utcMoment.format("H")}.dp`] = sum;
+    }
+    else if (sessionCount && (eventCount === null || typeof eventCount === 'undefined' || (typeof eventCount === 'object' && !Object.keys(eventCount).length))) {
+        incObject = {
+            s: sessionCount,
+            [`d.${utcMoment.format("D")}.${utcMoment.format("H")}.s`]: sessionCount,
+            [`d.${utcMoment.format("D")}.${utcMoment.format("H")}.dp`]: sessionCount
+        };
+    }
+    else if (typeof eventCount === 'number') {
+        incObject = {
+            e: eventCount,
+            s: sessionCount,
+            [`d.${utcMoment.format("D")}.${utcMoment.format("H")}.dp`]: sessionCount + eventCount,
+            [`d.${utcMoment.format("D")}.${utcMoment.format("H")}.e`]: eventCount,
+            [`d.${utcMoment.format("D")}.${utcMoment.format("H")}.s`]: sessionCount
+        };
+    }
+
+    writeBatcher.add('server_stats_data_points', appId + "_" + utcMoment.format("YYYY:M"), {
+        $set: {
+            a: appId + "",
+            m: utcMoment.format("YYYY:M")
+        },
+        $inc: incObject
+    });
+
+    if (consolidated) {
+        appId = "[CLY]_consolidated";
+        writeBatcher.add('server_stats_data_points', appId + "_" + utcMoment.format("YYYY:M"), {
+            $set: {
+                a: appId + "",
+                m: utcMoment.format("YYYY:M")
+            },
+            $inc: incObject
+        });
+    }
+}
+
+/**
+ *  Check if data should be counted as consolidated
+ *  @param {params} params - params object
+ *  @returns {boolean} true if consolidated
+ */
+function isConsolidated(params) {
+    if (params && (params.isConsolidated || (params.req && params.req.method === "consolidate") || (params.qstring && params.qstring.consolidateAppIds))) {
+        return true;
+    }
+    return false;
+}
+
+/**
+* Update data-point object with new events and sessions counts
+* @param {object} object - object which will be updated
+* @param {object} data - passed data object which contains events and sessions count
+* @returns {object} Returns manipulated object
+**/
+function increaseDataPoints(object, data) {
+    object.events += (data.e || 0);
+    object.sessions += (data.s || 0);
+    object.push += (data.p || 0);
+    object.crash += (data.c || 0);
+    object.views += (data.v || 0);
+    object.actions += (data.ac || 0);
+    object.nps += (data.n || 0);
+    object.surveys += (data.srv || 0);
+    object.ratings += (data.str || 0);
+    object.apm += (data.apm || 0);
+    object.custom += (data.ce || 0);
+    object.cs += (data.cs || 0);
+    object.ps += (data.ps || 0);
+    object.llm += (data.llm || 0);
+    object.aclk += (data.aclk || 0);
+    if (data.dp) {
+        object.dp += data.dp;
+    }
+    else {
+        object.dp += ((data.e || 0) + (data.s || 0));
+    }
+
+    return object;
+}
+
+/**
+ * punchCard function
+ * @param {db} db - database object
+ * @param {Object} filter - MongoDB query
+ * @param {Object} options - Date object
+ * @returns {Promise<Array>} - dataPoints
+ */
+function punchCard(db, filter, options) {
+    var dateObj = options.dateObj;
+
+    var ROW = 7;
+    var useDateAsDay = false;
+    var labels = [];
+    if (options.periodObj.daysInPeriod <= 7) {
+        ROW = options.periodObj.daysInPeriod;
+        useDateAsDay = true;
+        for (let k = 0; k < options.periodObj.currentPeriodArr.length; k++) {
+            labels.push(options.periodObj.currentPeriodArr[k]);
+        }
+    }
+    const TIME_RANGE = 24;
+
+    const COLLECTION_NAME = "server_stats_data_points";
+    return new Promise((resolve, reject) => {
+        db.collection(COLLECTION_NAME).find(filter).toArray((error, results) => {
+            if (error) {
+                return reject(error);
+            }
+
+            var data = [];
+            for (let p = 0; p < ROW; p++) {
+                for (let m = 0; m < TIME_RANGE; m++) {
+                    data.push({"value": {}, "min": null, "max": 0, "sum": 0, "avg": 0, "cn": {}, "s": 0, "e": 0});
+                }
+            }
+
+            for (let pointNumber = 0; pointNumber < results.length; pointNumber++) {
+                const result = results[pointNumber];
+                const splitFormat = result._id.split('_')[1].split(':');
+                const year = parseInt(splitFormat[0]);
+                const month = (parseInt(splitFormat[1]) - 1);
+                const dates = result.d;
+                for (const date in dates) { //each day
+                    let getWeekDay = moment().year(year).month(month).date(date).isoWeekday() - 1;
+                    if (useDateAsDay) {
+                        getWeekDay = labels.indexOf(year + "." + (month + 1) + "." + date);
+                    }
+                    if (dateObj[year + ":" + (month + 1)] && (dateObj[year + ":" + (month + 1)].full || dateObj[year + ":" + (month + 1)][date]) && getWeekDay > -1) {
+                        for (let k = 0; k < TIME_RANGE; k++) { //each hour
+                            if (dates[date][k]) {
+                                if (dates[date][k].dp) {
+                                    data[getWeekDay * TIME_RANGE + k].cn[year + ":" + (month + 1) + ":" + date + ":" + k] = true;
+                                    data[getWeekDay * TIME_RANGE + k].value[year + ":" + (month + 1) + ":" + date + ":" + k] = (data[getWeekDay * TIME_RANGE + k].value[year + ":" + (month + 1) + ":" + date + ":" + k] || 0) + dates[date][k].dp;
+
+                                    data[getWeekDay * TIME_RANGE + k].sum += dates[date][k].dp;
+
+                                }
+                                data[getWeekDay * TIME_RANGE + k].e += (dates[date][k].e || 0);
+                                data[getWeekDay * TIME_RANGE + k].s += (dates[date][k].s || 0);
+                                data[getWeekDay * TIME_RANGE + k].p += (dates[date][k].p || 0);
+                            }
+                        }
+                    }
+                }
+            }
+
+            for (var p = 0; p < data.length; p++) {
+                data[p].cn = Object.keys(data[p].cn);
+                data[p].cn = data[p].cn.length;
+
+                for (var z in data[p].value) {
+                    if (data[p].value[z] > data[p].max) {
+                        data[p].max = data[p].value[z];
+                    }
+
+                    if (data[p].min === null || data[p].value[z] < data[p].min) {
+                        data[p].min = data[p].value[z];
+                    }
+                }
+                delete data[p].value;
+
+                data[p] = [p % TIME_RANGE, Math.floor(p / TIME_RANGE), data[p].sum, data[p]];
+            }
+            resolve({"data": data, "dayCount": options.periodObj.daysInPeriod, labels: labels});
+        });
+    });
+}
+/**
+ *  Get's datapoint data from database and outputs it to browser
+ *  @param {db} db - database object
+ *  @param {object} filter - to filter documents
+ *  @param {object} options - array with periods
+ *  @param {boolean} options.monthlyBreakdown - if true, will calculate monthly data points breakdown for all apps (used to get license metric)
+ *  @param {string} options.license_hosting - client hosting type, could be countly hosted or self hosted. This will determine how consolidated data points should be added to total data points
+ *  @param {boolean} options.dailyDates - array of dates in YYYY:M:D format for daily data points (used to get data points for last 30 days)
+ *  @param {Function} callback - callback
+ */
+function fetchDatapoints(db, filter, options, callback) {
+    var TIME_RANGE = 24;
+    options.dateObjPrev = options.dateObjPrev || {};
+    db.collection("server_stats_data_points").find(filter, {}).toArray(function(err, result) {
+        var toReturn = {
+            "all-apps": {"events": 0, "sessions": 0, "push": 0, "dp": 0, "change": 0, "crash": 0, "views": 0, "actions": 0, "nps": 0, "surveys": 0, "ratings": 0, "apm": 0, "custom": 0, cs: 0, ps: 0, llm: 0, aclk: 0},
+        };
+
+        if (err || !result) {
+            console.log("Failed to get datapoints", err);
+            return callback(toReturn);
+        }
+
+        if (options.monthlyBreakdown) {
+            var apps = {};
+            const dataPoints = result
+                .reduce((acc, current) => {
+                    let dp = (current.e || 0) + (current.s || 0);
+                    var appId = current.a;
+                    if (appId && typeof appId !== "undefined" && appId !== "[CLY]_consolidated" && !apps[appId]) {
+                        apps[appId] = 0;
+                    }
+
+                    if (/^\[CLY\]_consolidated/.test(current._id)) {
+                        // do not count consolidated dp for countly hosted clients
+                        if (options.license_hosting === 'Countly-Hosted') {
+                            dp = 0;
+                        }
+                        // subtract consolidated dp for self hosted clients to get natural dp
+                        else {
+                            dp *= -1;
+                        }
+                    }
+
+                    if (current.m in acc) {
+                        acc[current.m] += dp;
+                    }
+                    else {
+                        acc[current.m] = dp;
+                    }
+
+                    if (options.dailyDates && options.dailyDates.length && current.m && (!/^\[CLY\]_consolidated/.test(current._id) || options.license_hosting === 'Countly-Hosted')) {
+                        if (!acc.daily) {
+                            acc.daily = {};
+                        }
+                        if (!acc.dailybreakdown) {
+                            acc.dailybreakdown = {};
+                        }
+                        options.dailyDates.forEach(date => {
+                            if (date.startsWith(current.m)) {
+                                var day = date.split(":")[2];
+                                if (current.d && current.d[day] && Object.keys(current.d[day]).length) {
+                                    for (var hour in current.d[day]) {
+                                        acc.dailybreakdown[date] = acc.dailybreakdown[date] || {};
+                                        if (current.d[day][hour].dp) {
+                                            acc.daily[date] = (acc.daily[date] || 0) + (current.d[day][hour].dp || 0);
+                                            acc.dailybreakdown[date].actions = (acc.dailybreakdown[date].actions || 0) + (current.d[day][hour].ac || 0);
+                                            acc.dailybreakdown[date].attribution_click = (acc.dailybreakdown[date].attribution_click || 0) + (current.d[day][hour].aclk || 0);
+                                            acc.dailybreakdown[date].crash = (acc.dailybreakdown[date].crash || 0) + (current.d[day][hour].c || 0);
+                                            acc.dailybreakdown[date].custom_events = (acc.dailybreakdown[date].custom_events || 0) + (current.d[day][hour].ce || 0);
+                                            acc.dailybreakdown[date].consents = (acc.dailybreakdown[date].consents || 0) + (current.d[day][hour].cs || 0);
+                                            acc.dailybreakdown[date].nps = (acc.dailybreakdown[date].nps || 0) + (current.d[day][hour].n || 0);
+                                            acc.dailybreakdown[date].sessions = (acc.dailybreakdown[date].sessions || 0) + (current.d[day][hour].s || 0);
+                                            acc.dailybreakdown[date].surveys = (acc.dailybreakdown[date].surveys || 0) + (current.d[day][hour].srv || 0);
+                                            acc.dailybreakdown[date].ratings = (acc.dailybreakdown[date].ratings || 0) + (current.d[day][hour].str || 0);
+                                            acc.dailybreakdown[date].views = (acc.dailybreakdown[date].views || 0) + (current.d[day][hour].v || 0);
+                                            acc.dailybreakdown[date].push_action = (acc.dailybreakdown[date].push_action || 0) + (current.d[day][hour].p || 0);
+                                            acc.dailybreakdown[date].apm = (acc.dailybreakdown[date].apm || 0) + (current.d[day][hour].apm || 0);
+                                            acc.dailybreakdown[date].push_sent = (acc.dailybreakdown[date].push_sent || 0) + (current.d[day][hour].ps || 0);
+                                            acc.dailybreakdown[date].llm = (acc.dailybreakdown[date].llm || 0) + (current.d[day][hour].llm || 0);
+                                        }
+                                        else {
+                                            acc.daily[date] = (acc.daily[date] || 0) + (current.d[day][hour].e || 0) + (current.d[day][hour].s || 0);
+                                        }
+                                    }
+                                    if (typeof apps[appId] !== "undefined") {
+                                        apps[appId] += acc.daily[date];
+                                    }
+                                }
+                            }
+                        });
+                    }
+
+                    return acc;
+                }, {});
+            dataPoints.apps = apps;
+            return callback(dataPoints);
+        }
+
+        for (let i = 0; i < result.length; i++) {
+            if (!toReturn[result[i].a]) {
+                toReturn[result[i].a] = {"events": 0, "sessions": 0, "push": 0, "dp": 0, "change": 0, "crash": 0, "views": 0, "actions": 0, "nps": 0, "surveys": 0, "ratings": 0, "apm": 0, "custom": 0, cs: 0, ps: 0, llm: 0, aclk: 0};
+            }
+            const dates = result[i].d;
+            if (options.dateObj[result[i].m]) {
+                if (options.dateObj[result[i].m].full) {
+                    toReturn["all-apps"] = increaseDataPoints(toReturn["all-apps"], result[i]);
+                    toReturn[result[i].a] = increaseDataPoints(toReturn[result[i].a], result[i]);
+                }
+                else {
+                    for (const date in dates) {
+                        if (options.dateObj[result[i].m][date]) {
+                            for (let k = 0; k < TIME_RANGE; k++) { //each hour
+                                if (dates[date][k]) {
+                                    toReturn["all-apps"] = increaseDataPoints(toReturn["all-apps"], dates[date][k]);
+                                    toReturn[result[i].a] = increaseDataPoints(toReturn[result[i].a], dates[date][k]);
+                                }
+                            }
+
+                        }
+                    }
+                }
+            }
+            if (options.dateObjPrev[result[i].m]) {
+                if (options.dateObjPrev[result[i].m].full) {
+                    toReturn["all-apps"].change += ((result[i].e || 0) + (result[i].s || 0));
+                    toReturn[result[i].a].change += ((result[i].e || 0) + (result[i].s || 0));
+                }
+                else {
+                    for (const date in dates) {
+                        if (options.dateObjPrev[result[i].m][date]) {
+                            for (let k = 0; k < TIME_RANGE; k++) { //each hour
+                                if (dates[date][k]) {
+
+                                    toReturn["all-apps"].change += dates[date][k].dp;
+                                    toReturn[result[i].a].change += dates[date][k].dp;
+                                }
+                            }
+
+                        }
+                    }
+
+                }
+
+            }
+
+        }
+        if (toReturn["[CLY]_consolidated"] && toReturn["all-apps"]) {
+            //Calculate all-apps data without [CLY]_consolidated data to remove duplication
+            for (let metric in toReturn["all-apps"]) {
+                if (toReturn["[CLY]_consolidated"] && toReturn["[CLY]_consolidated"][metric]) {
+                    toReturn["all-apps"][metric] -= toReturn["[CLY]_consolidated"][metric];
+                }
+            }
+        }
+        if (!options.singleApp && toReturn["[CLY]_consolidated"] && toReturn["all-apps"]) {
+            //if we have consolidated data, calculate all data without consolidated data
+            toReturn["natural-dp"] = {"events": 0, "sessions": 0, "push": 0, "dp": 0, "change": 0};
+
+            for (let metric in toReturn["all-apps"]) {
+                toReturn["natural-dp"][metric] += toReturn["all-apps"][metric];
+                if (toReturn["[CLY]_consolidated"] && toReturn["[CLY]_consolidated"][metric]) {
+                    toReturn["natural-dp"][metric] -= toReturn["[CLY]_consolidated"][metric];
+                }
+            }
+
+        }
+        if (options.singleApp) {
+            delete toReturn["all-apps"];
+        }
+        for (var z in toReturn) {
+            // a key off a stored document or a parsed payload can be a prototype
+            // member name; writing through one would reach Object.prototype
+            if (z === "__proto__" || z === "constructor" || z === "prototype") {
+                continue;
+            }
+            toReturn[z].change = toReturn[z].dp - toReturn[z].change;
+        }
+        callback(toReturn);
+    });
+}
+
+/**
+ *  Get top apps DP for current hour
+ *  @param {db} db - DB object
+ *  @param {object} params - params object
+ *  @param {Function} callback - callback
+ *  @param {Array=} appList - optional list of app ids to restrict results to (used for non global admins)
+ */
+function getTop(db, params, callback, appList) {
+    var utcMoment = moment.utc();
+    var curMonth = utcMoment.format("YYYY") + ":" + utcMoment.format("M");
+    var curDate = utcMoment.format("D");
+    var curHour = utcMoment.format("H");
+    //match on the stored month field instead of a leading-wildcard regex on
+    //_id (which can't use an index and forces a collection scan)
+    var query = {m: curMonth};
+    //when an app scope is provided (non global admins) restrict the
+    //aggregation to those apps so other apps' datapoints are not disclosed
+    if (Array.isArray(appList)) {
+        query.a = {$in: appList};
+    }
+    db.collection("server_stats_data_points").find(query, {}).toArray(function(err, data) {
+        var res = {};
+        if (data) {
+            for (let i = 0; i < data.length; i++) {
+                res[data[i].a] = res[data[i].a] || 0;
+                if (data[i] && data[i].d && data[i].d[curDate] && data[i].d[curDate][curHour] && data[i].d[curDate][curHour].dp) {
+                    res[data[i].a] += data[i].d[curDate][curHour].dp;
+                }
+
+                if (data[i] && data[i].d && data[i].d[curDate] && data[i].d[curDate][parseInt(curHour) - 1] && data[i].d[curDate][parseInt(curHour) - 1].dp) {
+                    res[data[i].a] += data[i].d[curDate][parseInt(curHour) - 1].dp;
+                }
+            }
+        }
+        var rr = [];
+        for (var app in res) {
+            if (app !== "[CLY]_consolidated") {
+                rr.push({"a": app, "v": res[app]});
+            }
+        }
+        rr = rr.sort(function(a, b) {
+            return b.v - a.v;
+        });
+        rr = rr.slice(0, 3);
+        callback(rr);
+    });
+}
+
+
+/**
+* Returns a human readable name given application id.
+* @param {string} appId - Application Id
+* @param {Object} appNames - app id to app name mapping
+* @returns {string} Returns a readable name
+**/
+function getAppName(appId, appNames) {
+    if (appId === "all-apps") {
+        return "(" + "All Datapoints" + ")";
+    }
+    else if (appId === "[CLY]_consolidated") {
+        return "(" + "Consolidated Datapoints" + ")";
+    }
+    else if (appId === "natural-dp") {
+        return "(" + "Natural Datapoints" + ")";
+    }
+    else if (appNames[appId]) {
+        return appNames[appId];
+    }
+    else {
+        return "App name not available (" + appId + ")";
+    }
+}
+
+
+module.exports = {updateDataPoints, isConsolidated, increaseDataPoints, punchCard, fetchDatapoints, getTop, getAppName, internalEventsEnum};

@@ -1,0 +1,1965 @@
+/**
+* Module for validation functions that manage access rights to application data. Divided in parts access for Global Admins, Admins and Users.
+* @module api/utils/rights
+*/
+var common = require("./common.js"),
+    plugins = require('../../plugins/pluginManager.js'),
+    Promise = require("bluebird"),
+    crypto = require('crypto'),
+    log = require('./log.js')('core:rights');
+
+var authorize = require('./authorizer.js'); //for token validations
+
+var collectionMap = {};//map to know when data about som collections/events was refreshed
+var cachedSchema = {};
+
+//check token and return owner id if token valid
+//owner d used later to set all member variables.
+/**Validate if token exists and is not expired(uzing authorize.js)
+* @param {object} params  params
+* @param {string} params.qstring.auth_token  authentication token
+* @param {string}params.req.headers.countly-token {string} authentication token
+* @param {string} params.fullPath current full path
+* @returns {Promise} promise 
+*/
+function validate_token_if_exists(params) {
+    return new Promise(function(resolve) {
+        var token = params.qstring.auth_token || params.req.headers["countly-token"] || "";
+        if (token && token !== "") {
+            authorize.verify_return({
+                db: common.db,
+                qstring: params.qstring,
+                token: token,
+                req_path: params.fullPath,
+                //ask for the document rather than just the owner, and keep it on params.
+                //A single use token (multi false) is consumed by this very call, so a
+                //handler that wants to know what the token was restricted to cannot read
+                //it back afterwards - the row is already gone, and absence would read as
+                //"no restriction". This is the only point at which it is still there.
+                return_data: true,
+                callback: function(valid) {
+                //false, or the token document because return_data is set
+                    if (valid && typeof valid === "object") {
+                        params.token_data = valid;
+                        resolve(valid.owner);
+                    }
+                    else if (valid) {
+                        //an authorizer that ignored return_data would hand back the owner id
+                        resolve(valid);
+                    }
+                    else {
+                        resolve('token-invalid');
+                    }
+
+                }
+            });
+        }
+        else {
+            resolve("token-not-given");
+        }
+    });
+}
+
+/**
+* Bound a member by the permissions of the token used to authenticate as them.
+*
+* Authenticating with a token resolves to the token's owner, and every validator then decides
+* what to allow from that member. Without this step the member is loaded at full strength, so a
+* token deliberately scoped to one app authorizes everything its owner can do - the escalation
+* this model exists to prevent. Applied as soon as the member is loaded, so that the validators'
+* own permission checks already see the bounded member.
+*
+* A token created before this model with an app restriction is bounded to its owner's authority
+* on those apps. A token with no restriction at all (an api_key request, a dashboard session
+* token) is returned unchanged, so existing integrations are unaffected.
+* @param {params} params - {@link params} object, carrying token_data when a token was used
+* @param {object} member - member document loaded for the token owner
+* @returns {object} the member, bounded by the token's permissions when the token is scoped
+*/
+function applyTokenScope(params, member) {
+    if (params.token_data && params.token_data.token_permission) {
+        member = exports.intersectPermission(member, params.token_data.token_permission);
+    }
+    else if (member && params.token_data && isScopeRestricted(params.token_data.app)) {
+        //a legacy token restricted to apps carries its owner's authority on those apps and none
+        //elsewhere. authorizer.js only enforces the restriction against a request's app_id, so a
+        //route that takes no app_id - an app listing, user management - saw the owner at full
+        //strength, global_admin included. Bounding the member to those apps holds everywhere.
+        //A malformed stored list can contain only empty entries. It is still a
+        //restriction, and intersecting with no apps must remove global authority.
+        member = exports.intersectPermission(member, appOnlyPermission(legacyTokenApps(params.token_data)));
+    }
+    //the owner's api_key is the owner's full authority, and the member left on params is what
+    //every handler acts with: anything that later reached for params.member.api_key would run with
+    //more than the token holds, and keep running after the token is revoked. A scoped credential
+    //carries no key, so such code finds nothing rather than an escalation. A legacy app/endpoint
+    //restricted token is scoped as well, so it loses the key even without token_permission.
+    //It is also marked with a reference to the token (credentialRef - never the token itself,
+    //which is a bearer secret; true when it has no id), so that code which authorizes on who the
+    //member is can tell the token apart from its owner.
+    if (member && exports.isScopedCredential(params)) {
+        member = Object.assign({}, member);
+        delete member.api_key;
+        member.scoped_credential = exports.credentialRef(params.token_data._id) || true;
+        //custom dashboards are not app scoped: a dashboard is opened by ownership and sharing, and
+        //everyone who opens it reads every widget on it, whatever app the widget reads. So a scoped
+        //token reaches the owner's dashboards only through a grant of its own, kept here because
+        //intersectPermission rebuilds the per-app permission and drops it
+        member.dashboard_grant = dashboardGrant(params.token_data.token_permission);
+    }
+    return member;
+}
+
+/**
+* Apps a legacy (pre-permission-model) token is restricted to.
+* @param {object} token - auth_tokens document
+* @returns {string[]} app ids, empty when the token has no app restriction
+*/
+function legacyTokenApps(token) {
+    var apps = token.app;
+    if (typeof apps === "string") {
+        apps = apps === "" ? [] : [apps];
+    }
+    return Array.isArray(apps) ? apps.filter(function(appId) {
+        return typeof appId === "string" && appId !== "";
+    }) : [];
+}
+
+/**
+* Whether a legacy token scope field asks for a restriction, including a
+* malformed non-empty list whose entries normalize to no valid apps.
+* @param {string|Array} scope - token app or endpoint field
+* @returns {boolean} true if the field represents a restriction
+*/
+function isScopeRestricted(scope) {
+    return !(scope === undefined || scope === null || scope === "" || (Array.isArray(scope) && scope.length === 0));
+}
+
+/**
+* A permission granting everything on the given apps, to intersect an owner with: the result is
+* exactly the owner's own authority on those apps.
+* @param {string[]} apps - app ids
+* @returns {object} permission object
+*/
+function appOnlyPermission(apps) {
+    var permission = {_: {a: apps.slice(), u: [apps.slice()]}, c: {}, r: {}, u: {}, d: {}};
+    apps.forEach(function(appId) {
+        ["c", "r", "u", "d"].forEach(function(type) {
+            permission[type][appId] = {all: true, allowed: {}};
+        });
+    });
+    return permission;
+}
+
+/**
+* A non-secret reference to a token: what may be stored or compared where the token itself, a
+* bearer credential, must not appear - on params.member.
+* @param {string} tokenId - auth_tokens _id (the token string)
+* @returns {string|null} the reference, or null for a missing id
+*/
+exports.credentialRef = function(tokenId) {
+    if (typeof tokenId !== "string" || tokenId === "") {
+        return null;
+    }
+    return crypto.createHash("sha256").update("countly-credential-ref:" + tokenId).digest("hex");
+};
+
+/**
+* The dashboard operations a token_permission grants under its dashboards key.
+*
+* Only an explicit true counts: per-app grants, all:true included, never imply it.
+* @param {object} tokenPermission - token_permission of a token, or undefined for a legacy token
+* @returns {{c: boolean, r: boolean, u: boolean, d: boolean}} granted operations
+*/
+function dashboardGrant(tokenPermission) {
+    var grant = (tokenPermission && tokenPermission.dashboards && typeof tokenPermission.dashboards === "object") ? tokenPermission.dashboards : {};
+    return {c: grant.c === true, r: grant.r === true, u: grant.u === true, d: grant.d === true};
+}
+
+/**
+* Whether a member may use custom dashboards for an operation.
+*
+* A member reached through its own api_key or an unrestricted token (a dashboard session) is the
+* owner and is decided by dashboard ownership and sharing alone. A scoped credential, marked by
+* applyTokenScope with its dashboard_grant, needs the operation in that grant; with it, it has the
+* owner's whole dashboard access.
+* @param {object} member - params.member, bounded by applyTokenScope
+* @param {string} operation - c, r, u or d
+* @returns {boolean} true if the member may use dashboards for this operation
+*/
+exports.hasDashboardAccess = function(member, operation) {
+    if (!member) {
+        return false;
+    }
+    if (!member.dashboard_grant) {
+        return true;
+    }
+    return member.dashboard_grant[operation] === true;
+};
+
+//exported so a route that resolves its own token can apply the same bounding rights.js
+//applies for every other route
+exports.applyTokenScope = applyTokenScope;
+/**
+* Validate user for read access by api_key for provided app_id (both required parameters for the request). 
+* User must exist, must not be locked, must pass plugin validation (if any) and have at least user access to the provided app (which also must exist).
+* If user does not pass validation, it outputs error to request. In case validation passes, provided callback is called.
+* Additionally populates params with member information and app information.
+* @param {params} params - {@link params} object
+* @param {Function} callback - function to call only if validation passes
+* @param {any=} callbackParam - parameter to pass to callback function (params is automatically passed to callback function, no need to include that)
+* @returns {Promise} promise
+*/
+exports.validateUserForRead = function(params, callback, callbackParam) {
+    return wrapCallback(params, callback, callbackParam, function(resolve, reject) {
+        validate_token_if_exists(params).then(function(result) {
+            var query = "";
+            // then result is owner id
+            if (result !== 'token-not-given' && result !== 'token-invalid') {
+                query = {'_id': common.db.ObjectID(result)};
+            }
+            else {
+                if (!params.qstring.api_key) {
+                    if (result === 'token-invalid') {
+                        common.returnMessage(params, 400, 'Token not valid');
+                        return false;
+                    }
+                    else {
+                        common.returnMessage(params, 400, 'Missing parameter "api_key" or "auth_token"');
+                        return false;
+                    }
+                }
+                params.qstring.api_key = params.qstring.api_key + "";
+                query = {'api_key': params.qstring.api_key};
+            }
+            common.db.collection('members').findOne(query, function(err, member) {
+                if (!member || err) {
+                    common.returnMessage(params, 401, 'User does not exist');
+                    reject('User does not exist');
+                    return false;
+                }
+
+                //bound the member by the token used to authenticate, before anything is authorized
+                member = applyTokenScope(params, member);
+
+                if (typeof params.qstring.app_id === "undefined") {
+                    common.returnMessage(params, 401, 'No app_id provided');
+                    reject('No app_id provided');
+                    return false;
+                }
+                const userApps = module.exports.getUserApps(member);
+
+                if (!((userApps.indexOf(params.qstring.app_id) !== -1) || member.global_admin)) {
+                    common.returnMessage(params, 401, 'User does not have right');
+                    reject('User does not have right');
+                    return false;
+                }
+
+                if (member && member.locked) {
+                    common.returnMessage(params, 401, 'User is locked');
+                    reject('User is locked');
+                    return false;
+                }
+
+                common.db.collection('apps').findOne({'_id': common.db.ObjectID(params.qstring.app_id + "")}, function(err1, app) {
+                    if (!app) {
+                        common.returnMessage(params, 401, 'App does not exist');
+                        reject('App does not exist');
+                        return false;
+                    }
+                    params.member = member;
+                    params.app_id = app._id;
+                    params.app_cc = app.country;
+                    params.appTimezone = app.timezone;
+                    params.app = app;
+                    params.time = common.initTimeObj(params.appTimezone, params.qstring.timestamp);
+
+                    if (plugins.dispatch("/validation/user", {params: params})) {
+                        if (!params.res.finished) {
+                            common.returnMessage(params, 401, 'User does not have right');
+                            reject('User does not have right');
+                        }
+                        return false;
+                    }
+
+                    plugins.dispatch("/o/validate", {
+                        params: params,
+                        app: app
+                    });
+
+                    resolve(callbackParam);
+                });
+            });
+        },
+        function() {
+            common.returnMessage(params, 401, 'Token is invalid');
+            reject('Token is invalid');
+            return false;
+        });
+    });
+};
+
+/**
+* Validate user for write access by api_key for provided app_id (both required parameters for the request). 
+* User must exist, must not be locked, must pass plugin validation (if any) and have at least admin access to the provided app (which also must exist).
+* If user does not pass validation, it outputs error to request. In case validation passes, provided callback is called.
+* Additionally populates params with member information and app information.
+* @param {params} params - {@link params} object
+* @param {Function} callback - function to call only if validation passes
+* @param {any=} callbackParam - parameter to pass to callback function (params is automatically passed to callback function, no need to include that)
+* @returns {Promise} promise
+*/
+exports.validateUserForWrite = function(params, callback, callbackParam) {
+    return wrapCallback(params, callback, callbackParam, function(resolve, reject) {
+        validate_token_if_exists(params).then(function(result) {
+            var query = "";
+            // then result is owner id
+            if (result !== 'token-not-given' && result !== 'token-invalid') {
+                query = {'_id': common.db.ObjectID(result)};
+            }
+            else {
+                if (!params.qstring.api_key) {
+                    if (result === 'token-invalid') {
+                        common.returnMessage(params, 400, 'Token not valid');
+                        return false;
+                    }
+                    else {
+                        common.returnMessage(params, 400, 'Missing parameter "api_key" or "auth_token"');
+                        return false;
+                    }
+                }
+                params.qstring.api_key = params.qstring.api_key + "";
+                query = {'api_key': params.qstring.api_key};
+            }
+            common.db.collection('members').findOne(query, function(err, member) {
+                if (!member || err) {
+                    common.returnMessage(params, 401, 'User does not exist');
+                    reject('User does not exist');
+                    return false;
+                }
+
+                //bound the member by the token used to authenticate, before anything is authorized
+                member = applyTokenScope(params, member);
+
+                if (!(module.exports.hasAdminAccess(member, params.qstring.app_id))) {
+                    common.returnMessage(params, 401, 'User does not have right');
+                    reject('User does not have right');
+                    return false;
+                }
+
+                if (member && member.locked) {
+                    common.returnMessage(params, 401, 'User is locked');
+                    reject('User is locked');
+                    return false;
+                }
+
+                common.db.collection('apps').findOne({'_id': common.db.ObjectID(params.qstring.app_id + "")}, function(err1, app) {
+                    if (!app) {
+                        common.returnMessage(params, 401, 'App does not exist');
+                        reject('App does not exist');
+                        return false;
+                    }
+                    else if ((params.populator || params.qstring.populator) && app.locked) {
+                        common.returnMessage(params, 403, 'App is locked');
+                        reject('App is locked');
+                        return false;
+                    }
+
+                    params.app_id = app._id;
+                    params.appTimezone = app.timezone;
+                    params.app = app;
+                    params.time = common.initTimeObj(params.appTimezone, params.qstring.timestamp);
+                    params.member = member;
+
+                    if (plugins.dispatch("/validation/user", {params: params})) {
+                        if (!params.res.finished) {
+                            common.returnMessage(params, 401, 'User does not have right');
+                            reject('User does not have right');
+                        }
+                        return false;
+                    }
+
+                    resolve(callbackParam);
+                });
+            });
+        },
+        function() {
+            common.returnMessage(params, 401, 'Token is invalid');
+            reject('Token is invalid');
+            return false;
+        });
+    });
+};
+
+/**
+* Validate user for global admin access by api_key (required parameter for the request). 
+* User must exist, must not be locked, must pass plugin validation (if any) and have global admin access.
+* If user does not pass validation, it outputs error to request. In case validation passes, provided callback is called.
+* Additionally populates params with member information.
+* @param {params} params - {@link params} object
+* @param {Function} callback - function to call only if validation passes
+* @param {any=} callbackParam - parameter to pass to callback function (params is automatically passed to callback function, no need to include that)
+* @returns {Promise} promise
+*/
+exports.validateGlobalAdmin = function(params, callback, callbackParam) {
+    return wrapCallback(params, callback, callbackParam, function(resolve, reject) {
+        validate_token_if_exists(params).then(function(result) {
+            var query = "";
+            // then result is owner id
+            if (result !== 'token-not-given' && result !== 'token-invalid') {
+                query = {'_id': common.db.ObjectID(result)};
+            }
+            else {
+                if (!params.qstring.api_key) {
+                    if (result === 'token-invalid') {
+                        common.returnMessage(params, 400, 'Token not valid');
+                        return false;
+                    }
+                    else {
+                        common.returnMessage(params, 400, 'Missing parameter "api_key" or "auth_token"');
+                        return false;
+                    }
+                }
+                params.qstring.api_key = params.qstring.api_key + "";
+                query = {'api_key': params.qstring.api_key};
+            }
+            common.db.collection('members').findOne(query, function(err, member) {
+                if (!member || err) {
+                    common.returnMessage(params, 401, 'User does not exist');
+                    reject('User does not exist');
+                    return false;
+                }
+
+                //bound the member by the token used to authenticate, before anything is authorized
+                member = applyTokenScope(params, member);
+
+                if (!member.global_admin) {
+                    common.returnMessage(params, 401, 'User does not have right');
+                    reject('User does not have right');
+                    return false;
+                }
+
+                if (member && member.locked) {
+                    common.returnMessage(params, 401, 'User is locked');
+                    reject('User is locked');
+                    return false;
+                }
+                params.member = member;
+                params.member.auth_token = params.qstring.auth_token || params.req.headers["countly-token"] || "";
+
+                if (plugins.dispatch("/validation/user", {params: params})) {
+                    if (!params.res.finished) {
+                        common.returnMessage(params, 401, 'User does not have right');
+                        reject('User does not have right');
+                    }
+                    return false;
+                }
+                resolve(callbackParam);
+            });
+        },
+        function() {
+            common.returnMessage(params, 401, 'Token is invalid');
+            reject('Token is invalid');
+            return false;
+        });
+    });
+};
+
+/**
+* Validate user for admin access for specific app by api_key (required parameter for the request). 
+* User must exist, must not be locked, must pass plugin validation (if any).
+* If user does not pass validation, it outputs error to request. In case validation passes, provided callback is called.
+* Additionally populates params with member information.
+* @param {params} params - {@link params} object
+* @param {Function} callback - function to call only if validation passes
+* @param {any=} callbackParam - parameter to pass to callback function (params is automatically passed to callback function, no need to include that)
+* @returns {Promise} promise
+*/
+exports.validateAppAdmin = function(params, callback, callbackParam) {
+    return wrapCallback(params, callback, callbackParam, function(resolve, reject) {
+        validate_token_if_exists(params).then(function(result) {
+            var query = "";
+            // then result is owner id
+            if (result !== 'token-not-given' && result !== 'token-invalid') {
+                query = {'_id': common.db.ObjectID(result)};
+            }
+            else {
+                if (!params.qstring.api_key) {
+                    if (result === 'token-invalid') {
+                        common.returnMessage(params, 400, 'Token not valid');
+                        return false;
+                    }
+                    else {
+                        common.returnMessage(params, 400, 'Missing parameter "api_key" or "auth_token"');
+                        return false;
+                    }
+                }
+                params.qstring.api_key = params.qstring.api_key + "";
+                query = {'api_key': params.qstring.api_key};
+            }
+            common.db.collection('members').findOne(query, function(err, member) {
+                if (!member || err) {
+                    common.returnMessage(params, 401, 'User does not exist');
+                    reject('User does not exist');
+                    return false;
+                }
+
+                //bound the member by the token used to authenticate, before anything is authorized
+                member = applyTokenScope(params, member);
+
+                if (!params.qstring.app_id) {
+                    common.returnMessage(params, 400, 'No app id provided');
+                    return false;
+                }
+
+                if (!member.global_admin) {
+                    //a permission without its app lists grants admin of no app; it must not throw here,
+                    //which answered every app admin call of such a member as if they did not exist
+                    if (!member.permission || !member.permission._ || !Array.isArray(member.permission._.a) || member.permission._.a.indexOf(params.qstring.app_id) === -1) {
+                        common.returnMessage(params, 401, 'User does not have right');
+                        reject('User does not have right');
+                        return false;
+                    }
+                }
+
+                if (member && member.locked) {
+                    common.returnMessage(params, 401, 'User is locked');
+                    reject('User is locked');
+                    return false;
+                }
+                params.member = member;
+                params.member.auth_token = params.qstring.auth_token || params.req.headers["countly-token"] || "";
+
+                if (plugins.dispatch("/validation/user", {params: params})) {
+                    if (!params.res.finished) {
+                        common.returnMessage(params, 401, 'User does not have right');
+                        reject('User does not have right');
+                    }
+                    return false;
+                }
+                resolve(callbackParam);
+            });
+        },
+        function() {
+            common.returnMessage(params, 401, 'Token is invalid');
+            reject('Token is invalid');
+            return false;
+        });
+    });
+};
+
+/**
+* Basic user validation by api_key (required parameter for the request), mostly used for custom validation afterwards (like multi app access).
+* User must exist, must not be locked and must pass plugin validation (if any).
+* If user does not pass validation, it outputs error to request. In case validation passes, provided callback is called.
+* Additionally populates params with member information.
+* @param {params} params - {@link params} object
+* @param {Function} callback - function to call only if validation passes
+* @param {any=} callbackParam - parameter to pass to callback function (params is automatically passed to callback function, no need to include that)
+* @returns {Promise} promise
+*/
+exports.validateUser = function(params, callback, callbackParam) {
+    //old backwards compatability call check
+    if (typeof params === "function") {
+        var temp = params;
+        params = callback;
+        callback = temp;
+    }
+
+    return wrapCallback(params, callback, callbackParam, function(resolve, reject) {
+        validate_token_if_exists(params).then(function(result) {
+            var query = "";
+            // then result is owner id
+            if (result !== 'token-not-given' && result !== 'token-invalid') {
+                query = {'_id': common.db.ObjectID(result)};
+            }
+            else {
+                if (!params.qstring.api_key) {
+                    if (result === 'token-invalid') {
+                        common.returnMessage(params, 400, 'Token not valid');
+                        return false;
+                    }
+                    else {
+                        common.returnMessage(params, 400, 'Missing parameter "api_key" or "auth_token"');
+                        return false;
+                    }
+                }
+                params.qstring.api_key = params.qstring.api_key + "";
+                query = {'api_key': params.qstring.api_key};
+            }
+            common.db.collection('members').findOne(query, function(err, member) {
+                if (!member || err) {
+                    common.returnMessage(params, 401, 'User does not exist');
+                    reject('User does not exist');
+                    return false;
+                }
+
+                //bound the member by the token used to authenticate, before anything is authorized
+                member = applyTokenScope(params, member);
+
+                if (member && member.locked) {
+                    common.returnMessage(params, 401, 'User is locked');
+                    reject('User is locked');
+                    return false;
+                }
+
+                params.member = member;
+
+                if (plugins.dispatch("/validation/user", {params: params})) {
+                    if (!params.res.finished) {
+                        common.returnMessage(params, 401, 'User does not have right');
+                        reject('User does not have right');
+                    }
+                    return false;
+                }
+
+                resolve(callbackParam);
+            });
+        },
+        function() {
+            common.returnMessage(params, 401, 'Token is invalid');
+            reject('Token is invalid');
+            return false;
+        });
+    });
+};
+/**
+* Wrap callback using promise
+* @param {params} params - {@link params} object
+* @param {Function} callback - function to call only if validation passes
+* @param {any=} callbackParam - parameter to pass to callback function
+* @param {Function} func - promise function
+* @returns {Promise} promise
+*/
+function wrapCallback(params, callback, callbackParam, func) {
+    var promise = new Promise(func);
+    if (typeof callback === "function") {
+        promise.asCallback(function(err) {
+            if (!err) {
+                let ret;
+                if (callbackParam) {
+                    ret = callback(callbackParam, params);
+                }
+                else {
+                    ret = callback(params);
+                }
+
+                if (ret && typeof ret.then === 'function') {
+                    ret.catch(e => {
+                        log.e('Error in CRUD callback', e);
+                        common.returnMessage(params, 500, 'Server error');
+                    });
+                }
+            }
+        });
+    }
+    else if (callback) {
+        console.log("Incorrect callback function", callback);
+    }
+    return promise;
+}
+
+/**
+ * Function to load and cache data
+ * @param {object} apps - apps 
+ * @param {Function} callback - callback function 
+ */
+function loadAndCacheEventsData(apps, callback) {
+    const appIds = [];
+    const appNamesById = {};
+    var anyNameMissing = false;
+    apps.forEach((app) => {
+        cachedSchema[app._id + ''] = cachedSchema[app._id + ''] || {};
+        cachedSchema[app._id + ''].loading = true;
+        appIds.push(common.db.ObjectID(app._id + ''));
+        appNamesById[app._id + ''] = app.name;
+        if (!appNamesById[app._id + '']) {
+            anyNameMissing = true;
+        }
+    });
+
+    /**
+    * Get events collections with replaced app names
+    * A helper function for db access check
+    * @param {object} appColl - application ids and names
+    * @param {Function} cb - callback method
+    **/
+    function getEvents(appColl, cb) {
+        common.db.collection('events').find({'_id': { $in: appColl.appIds }}).toArray(function(err, events) {
+            if (!err && events) {
+                for (let h = 0; h < events.length; h++) {
+                    if (events[h].list) {
+                        for (let i = 0; i < events[h].list.length; i++) {
+                            collectionMap[crypto.createHash('sha1').update(events[h].list[i] + events[h]._id + "").digest('hex')] = {"n": true, "a": events[h]._id + "", "e": events[h].list[i], "name": "(" + appNamesById[events[h]._id + ''] + ": " + events[h].list[i] + ")"};
+                        }
+                    }
+                }
+            }
+
+            appColl.appIds.forEach((appId) => {
+                if (plugins.internalDrillEvents) {
+                    for (let i = 0; i < plugins.internalDrillEvents.length; i++) {
+                        collectionMap[crypto.createHash('sha1').update(plugins.internalDrillEvents[i] + appId + "").digest('hex')] = {"n": true, "a": appId + "", "e": plugins.internalDrillEvents[i], "name": "(" + appColl.appNamesById[appId + ''] + ": " + plugins.internalDrillEvents[i] + ")"};
+                    }
+                }
+
+                if (plugins.internalEvents) {
+                    for (let i = 0; i < plugins.internalEvents.length; i++) {
+                        collectionMap[crypto.createHash('sha1').update(plugins.internalEvents[i] + appId + "").digest('hex')] = {"n": true, "a": appId + "", "e": plugins.internalEvents[i], "name": "(" + appColl.appNamesById[appId + ''] + ": " + plugins.internalEvents[i] + ")"};
+                    }
+                }
+            });
+            cb(null, true);
+        });
+    }
+
+    /**
+    * Get views collections with replaced app names
+    * A helper function for db access check
+    * @param {object} appColl - application ids and names
+    * @param {Function} cb - callback method
+    **/
+    function getViews(appColl, cb) {
+        common.db.collection('views').find({'_id': { $in: appColl.appIds }}).toArray(function(err, viewDocs) {
+            if (!err && viewDocs) {
+                for (let idx = 0; idx < viewDocs.length; idx++) {
+                    if (viewDocs[idx].segments) {
+                        for (var segkey in viewDocs[idx].segments) {
+                            collectionMap["app_viewdata" + crypto.createHash('sha1').update(segkey + viewDocs[idx]._id + '').digest('hex')] = {"n": true, "a": viewDocs[idx]._id + '', "vs": segkey, "name": "(" + appColl.appNamesById[viewDocs[idx]._id + ''] + ": " + segkey + ")"};
+                        }
+                    }
+                }
+            }
+            appColl.appIds.forEach((appId) => {
+                collectionMap["app_viewdata" + crypto.createHash('sha1').update("" + appId).digest('hex')] = {"n": true, "a": "" + appId, "vs": "", "name": "(" + appColl.appNamesById[appId + ''] + ": no-segment)"};
+            });
+            cb(null, true);
+        });
+    }
+
+    if (anyNameMissing) { //We do not have name for APPs, so we need to fetch them
+        common.db.collection('apps').find({'_id': { $in: appIds }}, {'name': 1}).toArray(function(err, newapps) {
+            if (err) {
+                log.e(err);
+                callback(err);
+            }
+            else {
+                for (var i = 0; i < newapps.length; i++) {
+                    newapps[i].name = newapps[i].name || "Unknown";
+                }
+                loadAndCacheEventsData(newapps, callback);
+            }
+        });
+    }
+    else {
+        getEvents({ appIds, appNamesById }, function(err) {
+            if (err) {
+                log.e(err);
+            }
+            getViews({ appIds, appNamesById }, function(err1) {
+                if (err1) {
+                    log.e(err1);
+                }
+                for (var item in collectionMap) {
+                    if (appNamesById[collectionMap[item].a]) {
+                        if (!collectionMap[item].n) {
+                            delete collectionMap[item];
+                        }
+                        else {
+                            delete collectionMap[item].n;
+                        }
+                    }
+                }
+                apps.forEach((app) => {
+                    cachedSchema[app._id + ''].ts = Date.now();
+                    cachedSchema[app._id + ''].loading = false;
+                });
+                common.cachedSchema = cachedSchema;
+                common.collectionMap = collectionMap;
+                callback(err || err1);
+            });
+        });
+    }
+
+
+}
+/**
+* Get events data
+* A helper function for db access check
+* @param {object} params - {@link params} object
+* @param {array} apps - array with each element being app document
+* @param {Function} callback - callback method
+**/
+function dbLoadEventsData(params, apps, callback) {
+    var events = {};
+    var views = {};
+    var callCalculate = [];
+    var appMap = {};
+    for (var a in apps) {
+        if (!cachedSchema[apps[a]._id + ''] || (cachedSchema[apps[a]._id + ''] && !cachedSchema[apps[a]._id + ''].loading && (Date.now() - cachedSchema[apps[a]._id + ''].ts) > 10 * 60 * 1000)) {
+            callCalculate.push(apps[a]);
+        }
+        appMap[apps[a]._id + ''] = true;
+    }
+
+    if (params.member.eventList) {
+        callback(null, params.member.eventList, params.member.viewList);
+        if (callCalculate.length > 0) {
+            loadAndCacheEventsData(callCalculate, function(err) {
+                if (err) {
+                    log.e(err);
+                }
+            });
+        }
+    }
+    else if (callCalculate.length > 0) {
+        loadAndCacheEventsData(callCalculate, function(err) {
+            if (err) {
+                log.e(err);
+            }
+            for (var key in collectionMap) {
+                if (appMap[collectionMap[key].a]) {
+                    if (collectionMap[key].e) {
+                        events[key] = collectionMap[key].name;
+                    }
+                    else if (collectionMap[key].vs) {
+                        views[key] = collectionMap[key].name;
+                    }
+                }
+            }
+            params.member.eventList = events;
+            params.member.viewList = views;
+            callback(null, events, views);
+        });
+    }
+    else {
+        for (var key in collectionMap) {
+            if (appMap[collectionMap[key].a]) {
+                if (collectionMap[key].e) {
+                    events[key] = collectionMap[key].name;
+                }
+                else if (collectionMap[key].vs) {
+                    views[key] = collectionMap[key].name;
+                }
+            }
+        }
+        params.member.eventList = events;
+        params.member.viewList = views;
+        callback(null, events, views);
+    }
+}
+exports.dbLoadEventsData = dbLoadEventsData;
+
+exports.getCollectionName = function(hashValue) {
+    if (collectionMap[hashValue]) {
+        return collectionMap[hashValue].name;
+    }
+    else {
+        return hashValue;
+    }
+};
+
+/**
+* Check user has access to collection
+* @param {object} params - {@link params} object
+* @param {string} collection - collection will be checked for access
+* @param {string} app_id - app_id to which to restrict access
+* @param {Function} callback - callback method includes boolean variable as argument  
+* @returns {Function} returns callback
+**/
+exports.dbUserHasAccessToCollection = function(params, collection, app_id, callback) {
+    if (typeof app_id === "function") {
+        callback = app_id;
+        app_id = null;
+    }
+    if (params.member.global_admin && !app_id) {
+        //global admin without app_id restriction just has access to everything
+        return callback(true);
+    }
+    var apps = [];
+    var userApps = module.exports.getUserApps(params.member);
+    var hashValue = "";
+    //use whatever user has permission for
+    apps = userApps || [];
+    // also check for app based restrictions
+    if (params.member.app_restrict) {
+        for (var appid in params.member.app_restrict) {
+            if (params.member.app_restrict[appid].indexOf("#/manage/db") !== -1 && apps.indexOf(appid) !== -1) {
+                apps.splice(apps.indexOf(appid), 1);
+            }
+        }
+    }
+    if (app_id) {
+        if (params.member.global_admin) {
+            apps = [app_id];
+        }
+        else {
+            apps = apps.filter(id => id + "" === app_id + "");
+        }
+    }
+    var appList = [];
+    if (collection.indexOf("events") === 0 || collection.indexOf("drill_events") === 0) {
+        for (let i = 0; i < apps.length; i++) {
+            if (apps[i].length) {
+                appList.push({_id: apps[i]});
+            }
+        }
+        hashValue = collection.replace("drill_events", "").replace("events", "");
+        dbLoadEventsData(params, appList, function(err) {
+            if (err) {
+                log.e("[rights.js].dbUserHasAccessToCollection() failed at dbLoadEventsData (events) callback.", err);
+                return callback(false);
+            }
+            else {
+                if (collectionMap[hashValue] && apps.length > 0 && apps.indexOf(collectionMap[hashValue].a) !== -1) {
+                    return callback(true);
+                }
+                else {
+                    return callback(false);
+                }
+            }
+        });
+    }
+    else if (collection.indexOf("app_viewdata") === 0) {
+        for (let i = 0; i < apps.length; i++) {
+            if (apps[i].length) {
+                appList.push({_id: apps[i]});
+            }
+        }
+        hashValue = collection;//we keep app_viewdata 
+
+        dbLoadEventsData(params, appList, function(err) {
+            if (err) {
+                log.e("[rights.js].dbUserHasAccessToCollection() failed at dbLoadEventsData (app_viewdata) callback.", err);
+                return callback(false);
+            }
+            else {
+                if (collectionMap[hashValue] && apps.length > 0 && apps.indexOf(collectionMap[hashValue].a) !== -1) {
+                    return callback(true);
+                }
+                else {
+                    return callback(false);
+                }
+
+            }
+
+        });
+    }
+    else {
+        for (let i = 0; i < apps.length; i++) {
+            if (apps[i].length > 0 && collection.indexOf(apps[i], collection.length - apps[i].length) !== -1) {
+                return callback(true);
+            }
+        }
+        return callback(false);
+    }
+};
+
+/**
+* Validate user for read access by api_key for provided app_id (both required parameters for the request).
+* User must exist, must not be locked, must pass plugin validation (if any) and have at least read access to the provided app (which also must exist).
+* If user does not pass validation, it outputs error to request. In case validation passes, provided callback is called.
+* Additionally populates params with member information and app information.
+* @param {params} params - {@link params} object
+* @param {string} feature - feature that trying to access
+* @param {Function} callback - function to call only if validation passes
+* @param {any=} callbackParam - parameter to pass to callback function (params is automatically passed to callback function, no need to include that)
+* @returns {Promise} promise
+*/
+exports.validateRead = function(params, feature, callback, callbackParam) {
+    return wrapCallback(params, callback, callbackParam, function(resolve, reject) {
+        validate_token_if_exists(params).then(function(result) {
+            var query = "";
+            // then result is owner id
+            if (result !== 'token-not-given' && result !== 'token-invalid') {
+                query = {'_id': common.db.ObjectID(result)};
+            }
+            else {
+                if (!params.qstring.api_key) {
+                    if (result === 'token-invalid') {
+                        common.returnMessage(params, 400, 'Token not valid');
+                        return false;
+                    }
+                    else {
+                        common.returnMessage(params, 400, 'Missing parameter "api_key" or "auth_token"');
+                        return false;
+                    }
+                }
+                params.qstring.api_key = params.qstring.api_key + "";
+                query = {'api_key': params.qstring.api_key};
+            }
+            common.db.collection('members').findOne(query, function(err, member) {
+                if (!member || err) {
+                    common.returnMessage(params, 401, 'User does not exist');
+                    reject('User does not exist');
+                    return false;
+                }
+
+                //bound the member by the token used to authenticate, before anything is authorized
+                member = applyTokenScope(params, member);
+
+                if (!member.global_admin && typeof params.qstring.app_id === "undefined") {
+                    common.returnMessage(params, 401, 'No app_id provided');
+                    reject('No app_id provided');
+                    return false;
+                }
+
+                // is member.permission exist?
+                // is member.permission an object?
+                // is params.qstring.app_id property of member.permission object?
+                // is member.permission.r[app_id].all is true?
+                // or member.global_admin?
+                if (!member.global_admin) {
+                    if (typeof member.permission !== 'undefined') {
+                        var isPermissionObjectExistForRead = (typeof member.permission.r === "object" && typeof member.permission.r[params.qstring.app_id] === "object");
+                        var isFeatureAllowedInReadPermissionObject = false;
+                        if (typeof feature === "string") {
+                            isFeatureAllowedInReadPermissionObject = isPermissionObjectExistForRead && (member.permission.r[params.qstring.app_id].all || (member.permission.r[params.qstring.app_id].allowed && member.permission.r[params.qstring.app_id].allowed[feature]));
+                        }
+                        else {
+                            isFeatureAllowedInReadPermissionObject = false;
+                            if (feature) {
+                                for (var i = 0; i < feature.length; i++) {
+                                    if (isPermissionObjectExistForRead && (member.permission.r[params.qstring.app_id].all || (member.permission.r[params.qstring.app_id].allowed && member.permission.r[params.qstring.app_id].allowed[feature[i]]))) {
+                                        isFeatureAllowedInReadPermissionObject = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        var hasAdminAccess = (typeof member.permission === "object" && typeof member.permission._ === "object" && typeof member.permission._.a === "object") && member.permission._.a.indexOf(params.qstring.app_id) > -1;
+                        // don't allow if user has not permission for feature and has no admin access for current app
+                        if (!(isFeatureAllowedInReadPermissionObject) && !(hasAdminAccess)) {
+                            common.returnMessage(params, 401, 'User does not have right');
+                            reject('User does not have right');
+                            return false;
+                        }
+                    }
+                    else {
+                        // check for legacy auth
+                        if (!((member.user_of && Array.isArray(member.user_of) && member.user_of.indexOf(params.qstring.app_id) !== -1) || member.global_admin)) {
+                            common.returnMessage(params, 401, 'User does not have right');
+                            reject('User does not have right');
+                            return false;
+                        }
+                    }
+                }
+
+                if (member && member.locked) {
+                    common.returnMessage(params, 401, 'User is locked');
+                    reject('User is locked');
+                    return false;
+                }
+
+                if (params.qstring.app_id) {
+                    common.db.collection('apps').findOne({'_id': common.db.ObjectID(params.qstring.app_id + "")}, function(err1, app) {
+                        if (!app) {
+                            common.returnMessage(params, 401, 'App does not exist');
+                            reject('App does not exist');
+                            return false;
+                        }
+                        else if (app) {
+                            params.app_id = app._id;
+                            params.app_cc = app.country;
+                            params.appTimezone = app.timezone;
+                            params.app = app;
+                            params.time = common.initTimeObj(params.appTimezone, params.qstring.timestamp);
+                        }
+
+                        params.member = member;
+
+                        if (plugins.dispatch("/validation/user", {params: params})) {
+                            if (!params.res.finished) {
+                                common.returnMessage(params, 401, 'User does not have right');
+                                reject('User does not have right');
+                            }
+                            return false;
+                        }
+
+                        if (app) {
+                            plugins.dispatch("/o/validate", {
+                                params: params,
+                                app: app
+                            });
+                        }
+
+                        resolve(callbackParam);
+                    });
+                }
+                else {
+                    params.member = member;
+
+                    if (plugins.dispatch("/validation/user", {params: params})) {
+                        if (!params.res.finished) {
+                            common.returnMessage(params, 401, 'User does not have right');
+                            reject('User does not have right');
+                        }
+                        return false;
+                    }
+
+                    resolve(callbackParam);
+                }
+            });
+        },
+        function() {
+            common.returnMessage(params, 401, 'Token is invalid');
+            reject('Token is invalid');
+            return false;
+        });
+    });
+};
+
+/**
+* Validate user for write access by api_key for provided app_id (both required parameters for the request).
+* User must exist, must not be locked, must pass plugin validation (if any) and have accessType that passed as accessType parameter to the provided app (which also must exist).
+* If user does not pass validation, it outputs error to request. In case validation passes, provided callback is called.
+* Additionally populates params with member information and app information.
+* @param {params} params - {@link params} object
+* @param {string} feature - feature that trying to access
+* @param {string} accessType - required access type for related request (c: create, u: update and d: delete)
+* @param {Function} callback - function to call only if validation passes
+* @param {any=} callbackParam - parameter to pass to callback function (params is automatically passed to callback function, no need to include that)
+* @returns {Promise} promise
+*/
+function validateWrite(params, feature, accessType, callback, callbackParam) {
+    return wrapCallback(params, callback, callbackParam, function(resolve, reject) {
+        validate_token_if_exists(params).then(function(result) {
+            var query = "";
+            //var appIdExceptions = ['global_users', 'global_applications', 'global_jobs', 'global_plugins', 'global_configurations', 'global_upload'];
+            // then result is owner id
+            if (result !== 'token-not-given' && result !== 'token-invalid') {
+                query = {'_id': common.db.ObjectID(result)};
+            }
+            else {
+                if (!params.qstring.api_key) {
+                    if (result === 'token-invalid') {
+                        common.returnMessage(params, 400, 'Token not valid');
+                        return false;
+                    }
+                    else {
+                        common.returnMessage(params, 400, 'Missing parameter "api_key" or "auth_token"');
+                        return false;
+                    }
+                }
+                params.qstring.api_key = params.qstring.api_key + "";
+                query = {'api_key': params.qstring.api_key};
+            }
+            common.db.collection('members').findOne(query, function(err, member) {
+                if (!member || err) {
+                    common.returnMessage(params, 401, 'User does not exist');
+                    reject('User does not exist');
+                    return false;
+                }
+
+                //bound the member by the token used to authenticate, before anything is authorized
+                member = applyTokenScope(params, member);
+
+                if (!member.global_admin && /*appIdExceptions.indexOf(feature) === -1 && */ typeof params.qstring.app_id === "undefined") {
+                    common.returnMessage(params, 401, 'No app_id provided');
+                    reject('No app_id provided');
+                    return false;
+                }
+
+                if (!member.global_admin) {
+                    if (typeof member.permission !== 'undefined') {
+                        var isPermissionObjectExistForAccessType = (typeof member.permission[accessType] === "object" && typeof member.permission[accessType][params.qstring.app_id] === "object");
+                        var isFeatureAllowedInRelatedPermissionObject = false;
+
+                        // if feature name passed as single string
+                        if (typeof feature === "string") {
+                            isFeatureAllowedInRelatedPermissionObject = isPermissionObjectExistForAccessType && (member.permission[accessType][params.qstring.app_id].all || (member.permission[accessType][params.qstring.app_id].allowed && member.permission[accessType][params.qstring.app_id].allowed[feature]));
+                        }
+                        // or feature name passed as string array
+                        else {
+                            isFeatureAllowedInRelatedPermissionObject = false;
+                            for (var i = 0; i < feature.length; i++) {
+                                if (isPermissionObjectExistForAccessType && (member.permission[accessType][params.qstring.app_id].all || (member.permission[accessType][params.qstring.app_id].allowed && member.permission[accessType][params.qstring.app_id].allowed[feature[i]]))) {
+                                    isFeatureAllowedInRelatedPermissionObject = true;
+                                    break;
+                                }
+                            }
+                        }
+
+                        var hasAdminAccess = (typeof member.permission === "object" && typeof member.permission._ === "object" && typeof member.permission._.a === "object") && member.permission._.a.indexOf(params.qstring.app_id) > -1;
+                        // don't allow if user has not permission for feature and has no admin access for current app
+                        if (!(isFeatureAllowedInRelatedPermissionObject) && !(hasAdminAccess)) {
+                            common.returnMessage(params, 401, 'User does not have right');
+                            reject('User does not have right');
+                            return false;
+                        }
+                    }
+                    else {
+                        if (!module.exports.hasAdminAccess(member, params.qstring.app_id)) {
+                            common.returnMessage(params, 401, 'User does not have right');
+                            reject('User does not have right');
+                            return false;
+                        }
+                    }
+                }
+
+                if (member && member.locked) {
+                    common.returnMessage(params, 401, 'User is locked');
+                    reject('User is locked');
+                    return false;
+                }
+
+                if (params.qstring.app_id) {
+                    common.db.collection('apps').findOne({'_id': common.db.ObjectID(params.qstring.app_id + "")}, function(err1, app) {
+                        if (!app) {
+                            common.returnMessage(params, 401, 'App does not exist');
+                            reject('App does not exist');
+                            return false;
+                        }
+                        else if ((params.populator || params.qstring.populator) && app.locked) {
+                            common.returnMessage(params, 403, 'App is locked');
+                            reject('App is locked');
+                            return false;
+                        }
+                        else if (app) {
+                            params.app_id = app._id;
+                            params.app = app;
+                            params.appTimezone = app.timezone;
+                            params.time = common.initTimeObj(params.appTimezone, params.qstring.timestamp);
+                        }
+
+                        params.member = member;
+
+                        if (plugins.dispatch("/validation/user", {params: params})) {
+                            if (!params.res.finished) {
+                                common.returnMessage(params, 401, 'User does not have right');
+                                reject('User does not have right');
+                            }
+                            return false;
+                        }
+
+                        resolve(callbackParam);
+                    });
+                }
+                else {
+                    params.member = member;
+
+                    if (plugins.dispatch("/validation/user", {params: params})) {
+                        if (!params.res.finished) {
+                            common.returnMessage(params, 401, 'User does not have right');
+                            reject('User does not have right');
+                        }
+                        return false;
+                    }
+
+                    resolve(callbackParam);
+                }
+            });
+        },
+        function() {
+            common.returnMessage(params, 401, 'Token is invalid');
+            reject('Token is invalid');
+            return false;
+        });
+    });
+}
+/**
+ * Apps of a member on which they hold the read right of at least one of the features
+ * @param {object} member - members object from params
+ * @param {string|Array<string>} feature - feature name, or a list of names any of which grants the read
+ * @returns {Array<string>} app ids
+ */
+exports.getUserAppsWithReadRight = function(member, feature) {
+    var features = Array.isArray(feature) ? feature : [feature];
+    //a token can hold a feature's read on an app without being its member, so the
+    //apps carrying read grants are candidates too; hasReadRight decides each one
+    var candidates = (exports.getUserApps(member) || []).map(String);
+    Object.keys((member.permission && member.permission.r) || {}).forEach(function(id) {
+        if (candidates.indexOf(id) === -1) {
+            candidates.push(id);
+        }
+    });
+    var readGrants = (member.permission && member.permission.r) || {};
+    return candidates.filter(function(id) {
+        //a blanket read on the app grants every feature, as validateRead counts it
+        if (readGrants[id] && readGrants[id].all === true) {
+            return true;
+        }
+        return features.some(function(f) {
+            return exports.hasReadRight(f, id, member);
+        });
+    });
+};
+
+/**
+ * Features whose read right lets a member export a collection shared by all apps
+ * (/o/export/db). These collections are not per-app collections, so
+ * dbUserHasAccessToCollection never grants them: the export needs the read right of one
+ * of these features on at least one app, and its rows are scoped to those apps.
+ * drill_events is also exported by the drill API and the user profile timeline.
+ * @param {string} dbName - database name
+ * @param {string} collectionName - collection name
+ * @returns {Array<string>|null} feature names, or null when the collection is not a shared one
+ */
+exports.getSharedCollectionExportFeatures = function(dbName, collectionName) {
+    if (dbName === "countly_drill" && collectionName === "drill_events") {
+        return ["dbviewer", "drill", "users"];
+    }
+    if (dbName === "countly" && collectionName === "events_data") {
+        return ["dbviewer"];
+    }
+    return null;
+};
+
+/**
+ * Creates filter object  to filter by member allowed collections
+ * @param {object} member - members object from params
+ * @param {string} dbName  - database name as string
+ * @param {string} collectionName  - collection Name
+ * @param {(string|Array<string>)=} feature - when given, only apps the member holds this
+ *   feature's read right on (any of them, for a list) are in scope, instead of every app
+ *   they belong to
+ * @returns {object} filter object
+ */
+exports.getBaseAppFilter = function(member, dbName, collectionName, feature) {
+    var base_filter = {};
+    var apps = exports.getUserApps(member);
+    // The shared collections hold every app's rows, so the row scope is the set
+    // of apps the member may read with the calling feature, not every app the
+    // member belongs to. Without a feature the scope stays membership-wide.
+    if (feature && !member.global_admin) {
+        apps = exports.getUserAppsWithReadRight(member, feature);
+    }
+    // getUserApps() returns [] both for a global admin (meaning "all apps") and
+    // for a non-global member that has no app access at all. Those two cases
+    // must NOT be treated the same: a global admin should see everything, but a
+    // non-global member with an empty app list must be scoped to nothing.
+    // Without this guard the empty list produced an empty {} filter, which the
+    // callers treat as "no scope" and therefore returned every app's rows.
+    var hasApps = Array.isArray(apps) && apps.length > 0;
+    if (dbName === "countly_drill" && collectionName === "drill_events") {
+        if (hasApps) {
+            base_filter.a = {"$in": apps};
+        }
+        else if (!member.global_admin) {
+            // non-global member without app access: match nothing
+            base_filter.a = {"$in": []};
+        }
+    }
+    else if (dbName === "countly" && collectionName === "events_data") {
+        if (hasApps) {
+            var in_array = [];
+            for (var i = 0; i < apps.length; i++) {
+                in_array.push(new RegExp("^" + apps[i] + "_.*"));
+            }
+            base_filter = {"_id": {"$in": in_array}};
+        }
+        else if (!member.global_admin) {
+            // non-global member without app access: match nothing
+            base_filter = {"_id": {"$in": []}};
+        }
+    }
+    return base_filter;
+};
+
+/**
+* App scope of a DB export from the collections shared by all apps (drill_events, events_data).
+* A global admin is not scoped.
+* @param {object} member - member object
+* @param {string} dbName - name of the database
+* @param {string} collectionName - name of the collection
+* @returns {object|null} the base app filter, or null when the export is not scoped
+*/
+exports.getExportAppFilter = function(member, dbName, collectionName) {
+    if (member.global_admin || (collectionName !== "drill_events" && collectionName !== "events_data")) {
+        return null;
+    }
+    //the rows of the apps the member holds the read right of an exporting feature on
+    var base_filter = exports.getBaseAppFilter(member, dbName, collectionName, exports.getSharedCollectionExportFeatures(dbName, collectionName));
+    return base_filter && Object.keys(base_filter).length > 0 ? base_filter : null;
+};
+
+/**
+* Restrict a query to an app scope. The query is kept as given and both must hold.
+* Apply it last, after /drill/preprocess_query, right before the read: a listener
+* rewrites the query in place and must not be able to reshape the scope.
+* @param {object} appFilter - app scope from getExportAppFilter, or null
+* @param {object} query - query to restrict
+* @returns {object} the restricted query
+*/
+exports.scopeQueryToApps = function(appFilter, query) {
+    if (!appFilter) {
+        return query;
+    }
+    return {$and: [appFilter, query || {}]};
+};
+/**
+* Validate user for create access by api_key for provided app_id (both required parameters for the request).
+* @param {params} params - {@link params} object
+* @param {string} feature - feature that trying to access
+* @param {Function} callback - function to call only if validation passes
+* @param {any=} callbackParam - parameter to pass to callback function (params is automatically passed to callback function, no need to include that)
+*/
+exports.validateCreate = function(params, feature, callback, callbackParam) {
+    validateWrite(params, feature, 'c', callback, callbackParam);
+};
+
+/**
+* Validate user for update access by api_key for provided app_id (both required parameters for the request).
+* @param {params} params - {@link params} object
+* @param {string} feature - feature that trying to access
+* @param {Function} callback - function to call only if validation passes
+* @param {any=} callbackParam - parameter to pass to callback function (params is automatically passed to callback function, no need to include that)
+*/
+exports.validateUpdate = function(params, feature, callback, callbackParam) {
+    validateWrite(params, feature, 'u', callback, callbackParam);
+};
+
+/**
+* Validate user for delete access by api_key for provided app_id (both required parameters for the request).
+* @param {params} params - {@link params} object
+* @param {string} feature - feature that trying to access
+* @param {Function} callback - function to call only if validation passes
+* @param {any=} callbackParam - parameter to pass to callback function (params is automatically passed to callback function, no need to include that)
+*/
+exports.validateDelete = function(params, feature, callback, callbackParam) {
+    validateWrite(params, feature, 'd', callback, callbackParam);
+};
+
+/**
+ * Is user has admin access on selected app?
+ * @param {object} member - member object from params
+ * @param {string} app_id - id value of related app
+ * @param {string} type - type of access (c, r, u, d)
+ * @returns {boolean} isAdmin - is that user has admin access on that app?
+ */
+exports.hasAdminAccess = function(member, app_id, type) {
+    var hasPermissionObject = typeof member.permission !== "undefined";
+    if (hasPermissionObject && member.permission._ && member.permission._.a && member.permission._.a.includes(app_id)) {
+        return true;
+    }
+
+    var isAdmin = false;
+    // check users who has permission property
+    if (hasPermissionObject) {
+        var types = type ? [type] : ["c", "r", "u", "d"];
+        var passesAllRules = true;
+        for (var i = 0; i < types.length; i++) {
+            if (member.permission[types[i]] && member.permission[types[i]][app_id]) {
+                if (!member.permission[types[i]][app_id].all) {
+                    passesAllRules = false;
+                }
+            }
+            else {
+                passesAllRules = false;
+            }
+        }
+        if (passesAllRules) {
+            isAdmin = true;
+        }
+
+    }
+    // check legacy users who has admin_of property
+    // users should have at least one app in admin_of array
+    else {
+        isAdmin = typeof member.admin_of !== "undefined" && member.admin_of.indexOf(app_id) > -1;
+    }
+    return isAdmin || member.global_admin;
+};
+
+exports.hasCreateRight = function(feature, app_id, member) {
+    var hasAppSpecificRight = (member.permission && member.permission.c && member.permission.c[app_id] && member.permission.c[app_id].allowed && member.permission.c[app_id].allowed[feature]);
+    var hasGlobalAdminRight = member.global_admin;
+    var hasAppAdminRight = exports.hasAdminAccess(member, app_id, "c");
+    return hasAppSpecificRight || hasGlobalAdminRight || hasAppAdminRight;
+};
+
+exports.hasReadRight = function(feature, app_id, member) {
+    var hasAppSpecificRight = (member.permission && member.permission.r && member.permission.r[app_id] && member.permission.r[app_id].allowed && member.permission.r[app_id].allowed[feature]);
+    var hasGlobalAdminRight = member.global_admin;
+    var hasAppAdminRight = exports.hasAdminAccess(member, app_id, "r");
+    return hasAppSpecificRight || hasGlobalAdminRight || hasAppAdminRight;
+};
+
+exports.hasUpdateRight = function(feature, app_id, member) {
+    var hasAppSpecificRight = (member.permission && member.permission.u && member.permission.u[app_id] && member.permission.u[app_id].allowed && member.permission.u[app_id].allowed[feature]);
+    var hasGlobalAdminRight = member.global_admin;
+    var hasAppAdminRight = exports.hasAdminAccess(member, app_id, "u");
+    return hasAppSpecificRight || hasGlobalAdminRight || hasAppAdminRight;
+};
+
+exports.hasDeleteRight = function(feature, app_id, member) {
+    var hasAppSpecificRight = (member.permission && member.permission.d && member.permission.d[app_id] && member.permission.d[app_id].allowed && member.permission.d[app_id].allowed[feature]);
+    var hasGlobalAdminRight = member.global_admin;
+    var hasAppAdminRight = exports.hasAdminAccess(member, app_id, "d");
+    return hasAppSpecificRight || hasGlobalAdminRight || hasAppAdminRight;
+};
+
+/**
+* Access types in a permission object, in their canonical order.
+*/
+var PERMISSION_TYPES = ["c", "r", "u", "d"];
+
+/**
+* Whether a principal grants a single feature on an app for one access type.
+*
+* A principal is anything holding authority: a member (with global_admin / permission, or the
+* legacy admin_of / user_of arrays), or a bare token permission set wrapped as {permission: obj}.
+* This is the same rule the hasCreateRight / hasReadRight / hasUpdateRight / hasDeleteRight
+* helpers apply to a member, expressed once so it can also be applied to a token.
+* @param {object} principal - object with permission (and optionally global_admin)
+* @param {string} type - access type (c, r, u, d)
+* @param {string} appId - id of the app
+* @param {string} feature - feature name
+* @returns {boolean} true if the principal allows that feature
+*/
+function principalAllows(principal, type, appId, feature) {
+    if (!principal) {
+        return false;
+    }
+    if (principal.global_admin) {
+        return true;
+    }
+    var permission = principal.permission;
+    if (typeof permission === "undefined") {
+        //legacy member: admin_of grants everything on the app, user_of grants reads
+        if (Array.isArray(principal.admin_of) && principal.admin_of.indexOf(appId) !== -1) {
+            return true;
+        }
+        return type === "r" && Array.isArray(principal.user_of) && principal.user_of.indexOf(appId) !== -1;
+    }
+    if (permission._ && Array.isArray(permission._.a) && permission._.a.indexOf(appId) !== -1) {
+        return true;
+    }
+    var forType = permission[type];
+    if (!forType || !forType[appId]) {
+        return false;
+    }
+    if (forType[appId].all === true) {
+        return true;
+    }
+    return !!(forType[appId].allowed && forType[appId].allowed[feature] === true);
+}
+
+/**
+* Whether a principal grants every feature on an app for one access type.
+*
+* Distinct from principalAllows because "all" also covers features that do not exist yet, so it
+* may only be granted by a principal that itself holds "all".
+* @param {object} principal - object with permission (and optionally global_admin)
+* @param {string} type - access type (c, r, u, d)
+* @param {string} appId - id of the app
+* @returns {boolean} true if the principal allows everything for that app and type
+*/
+function principalAllowsAll(principal, type, appId) {
+    if (!principal) {
+        return false;
+    }
+    if (principal.global_admin) {
+        return true;
+    }
+    var permission = principal.permission;
+    if (typeof permission === "undefined") {
+        if (Array.isArray(principal.admin_of) && principal.admin_of.indexOf(appId) !== -1) {
+            return true;
+        }
+        return type === "r" && Array.isArray(principal.user_of) && principal.user_of.indexOf(appId) !== -1;
+    }
+    if (permission._ && Array.isArray(permission._.a) && permission._.a.indexOf(appId) !== -1) {
+        return true;
+    }
+    var forType = permission[type];
+    return !!(forType && forType[appId] && forType[appId].all === true);
+}
+
+/**
+* Apps a principal is a member of - the ones it administers, and the ones it is a user of.
+*
+* Distinct from the apps it can reach a feature on: some validators (validateUserForRead and
+* validateUserForWrite) authorize on membership alone, so membership is authority in its own
+* right and has to be bounded separately from the c/r/u/d grants.
+* @param {object} principal - object with permission (and optionally the legacy arrays)
+* @returns {string[]} list of app ids the principal is a member of
+*/
+function principalMemberApps(principal) {
+    var apps = [];
+    /**
+    * Add an app id once.
+    * @param {string} appId - id of the app
+    * @returns {void}
+    */
+    var push = function(appId) {
+        if (apps.indexOf(appId) === -1) {
+            apps.push(appId);
+        }
+    };
+    if (!principal) {
+        return apps;
+    }
+    var permission = principal.permission;
+    if (typeof permission === "undefined") {
+        (principal.admin_of || []).forEach(push);
+        (principal.user_of || []).forEach(push);
+        return apps;
+    }
+    if (permission._) {
+        if (Array.isArray(permission._.a)) {
+            permission._.a.forEach(push);
+        }
+        if (Array.isArray(permission._.u)) {
+            for (var g = 0; g < permission._.u.length; g++) {
+                (permission._.u[g] || []).forEach(push);
+            }
+        }
+    }
+    return apps;
+}
+
+/**
+* Every app id a principal actually reaches: the ones it is a member of, plus the ones it holds
+* a c/r/u/d grant on.
+*
+* An entry under c/r/u/d that grants nothing does not count. The permission editor writes an
+* entry for every app the editing user could see, so a member routinely carries empty entries
+* for apps it has no access to at all; treating those as apps the member reaches would let a
+* token be scoped to one of them and come out wider than its own owner.
+* @param {object} principal - object with permission (and optionally the legacy arrays)
+* @returns {string[]} list of app ids
+*/
+function principalApps(principal) {
+    if (!principal) {
+        return [];
+    }
+    if (typeof principal.permission === "undefined") {
+        return principalMemberApps(principal);
+    }
+    return grantingApps(principal.permission);
+}
+
+/**
+* App ids a permission object actually grants something on.
+*
+* Distinct from principalApps: the permission editor emits an entry for every app the editing user
+* can see, most of them granting nothing, and an empty entry is not a grant. Apps listed under _.u
+* do count, because some validators authorize on app membership alone.
+* @param {object} permission - permission object
+* @returns {string[]} list of app ids the permission grants something on
+*/
+function grantingApps(permission) {
+    var apps = [];
+    /**
+    * Add an app id once.
+    * @param {string} appId - id of the app
+    * @returns {void}
+    */
+    var push = function(appId) {
+        if (apps.indexOf(appId) === -1) {
+            apps.push(appId);
+        }
+    };
+    if (!permission) {
+        return apps;
+    }
+    if (permission._) {
+        if (Array.isArray(permission._.a)) {
+            permission._.a.forEach(push);
+        }
+        if (Array.isArray(permission._.u)) {
+            for (var g = 0; g < permission._.u.length; g++) {
+                (permission._.u[g] || []).forEach(push);
+            }
+        }
+    }
+    for (var t = 0; t < PERMISSION_TYPES.length; t++) {
+        var forType = permission[PERMISSION_TYPES[t]] || {};
+        for (var appId in forType) {
+            var entry = forType[appId];
+            if (!entry) {
+                continue;
+            }
+            if (entry.all === true) {
+                push(appId);
+                continue;
+            }
+            for (var feature in entry.allowed || {}) {
+                if (entry.allowed[feature] === true) {
+                    push(appId);
+                    break;
+                }
+            }
+        }
+    }
+    return apps;
+}
+
+/**
+* Feature names a principal explicitly allows for an app and access type.
+* @param {object} principal - object with permission
+* @param {string} type - access type (c, r, u, d)
+* @param {string} appId - id of the app
+* @returns {string[]} list of feature names
+*/
+function principalFeatures(principal, type, appId) {
+    var features = [];
+    var permission = principal && principal.permission;
+    var entry = permission && permission[type] && permission[type][appId];
+    if (entry && entry.allowed) {
+        for (var feature in entry.allowed) {
+            if (entry.allowed[feature] === true) {
+                features.push(feature);
+            }
+        }
+    }
+    return features;
+}
+
+/**
+* Whether one permission set grants nothing beyond what a ceiling principal already holds.
+*
+* This is what bounds a grant to the credential that creates it: a token may only pass on
+* authority it holds itself. The ceiling is the member for an api_key or an unrestricted session,
+* and the parent token's own permissions when a token creates a token - so a token scoped to app A
+* cannot produce a child that reaches app B, even though their common owner can.
+* @param {object} childPermission - permission object being granted
+* @param {object} ceiling - principal that must already hold everything the child grants
+* @returns {boolean} true if childPermission is a subset of the ceiling's authority
+*/
+exports.isPermissionSubset = function(childPermission, ceiling) {
+    //a malformed permission grants nothing recognisable, and an empty-looking value must not be
+    //mistaken for "grants nothing, therefore a subset"
+    if (!childPermission || typeof childPermission !== "object" || Array.isArray(childPermission)) {
+        return false;
+    }
+    var t, appId, i;
+    //membership is authority of its own: validateUserForRead and validateUserForWrite authorize
+    //on it alone, without asking about any feature, and getUserApps drives app listings and
+    //data scoping. So an app the child names under _ - as admin or as user - has to be an app
+    //the ceiling is itself a member of. Holding features on an app, even all of them, is not the
+    //same as being a member of it: a member can carry all:true for an app that is absent from
+    //its own _.u/_.a, and hasAdminAccess would then call the child an admin of an app the owner
+    //is not even a member of.
+    var ceilingMemberApps = principalMemberApps(ceiling);
+    //an app the child administers implies every feature of every type, present and future
+    var childAdminApps = (childPermission._ && Array.isArray(childPermission._.a)) ? childPermission._.a : [];
+    for (i = 0; i < childAdminApps.length; i++) {
+        if (!ceiling.global_admin && ceilingMemberApps.indexOf(childAdminApps[i]) === -1) {
+            return false;
+        }
+        for (t = 0; t < PERMISSION_TYPES.length; t++) {
+            if (!principalAllowsAll(ceiling, PERMISSION_TYPES[t], childAdminApps[i])) {
+                return false;
+            }
+        }
+    }
+    //an app the child can reach at all must be an app the ceiling can reach
+    var ceilingApps = principalApps(ceiling);
+    var childApps = grantingApps(childPermission);
+    for (i = 0; i < childApps.length; i++) {
+        if (!ceiling.global_admin && ceilingApps.indexOf(childApps[i]) === -1) {
+            return false;
+        }
+    }
+    //and the same for the apps the child names as user apps
+    var childUserApps = [];
+    if (childPermission._ && Array.isArray(childPermission._.u)) {
+        for (i = 0; i < childPermission._.u.length; i++) {
+            childUserApps = childUserApps.concat(childPermission._.u[i] || []);
+        }
+    }
+    for (i = 0; i < childUserApps.length; i++) {
+        if (!ceiling.global_admin && ceilingMemberApps.indexOf(childUserApps[i]) === -1) {
+            return false;
+        }
+    }
+    for (t = 0; t < PERMISSION_TYPES.length; t++) {
+        var forType = childPermission[PERMISSION_TYPES[t]];
+        for (appId in forType || {}) {
+            var entry = forType[appId];
+            if (!entry) {
+                continue;
+            }
+            if (entry.all === true && !principalAllowsAll(ceiling, PERMISSION_TYPES[t], appId)) {
+                return false;
+            }
+            for (var feature in entry.allowed || {}) {
+                if (entry.allowed[feature] === true && !principalAllows(ceiling, PERMISSION_TYPES[t], appId, feature)) {
+                    return false;
+                }
+            }
+        }
+    }
+    //the dashboards grant is not per app: a child may hold an operation only where the ceiling
+    //may use dashboards for it, so a scoped token cannot hand out a grant it lacks
+    var dashboards = childPermission.dashboards;
+    if (typeof dashboards !== "undefined") {
+        if (!dashboards || typeof dashboards !== "object" || Array.isArray(dashboards)) {
+            return false;
+        }
+        for (t = 0; t < PERMISSION_TYPES.length; t++) {
+            if (dashboards[PERMISSION_TYPES[t]] === true && !exports.hasDashboardAccess(ceiling, PERMISSION_TYPES[t])) {
+                return false;
+            }
+        }
+    }
+    return true;
+};
+
+/**
+* Whether the credential that authenticated this request is narrower than its owner.
+*
+* True for a token carrying token_permission, and for a token restricted by the legacy
+* app/endpoint scope. False for an api_key (the member itself) and for an unrestricted token such
+* as a dashboard session token. Used to keep credential management - which hands out and revokes
+* the owner's other credentials - to credentials that are not themselves narrowed.
+* @param {params} params - {@link params} object
+* @returns {boolean} true if a scoped credential authenticated the request
+*/
+exports.isScopedCredential = function(params) {
+    var token = params && params.token_data;
+    if (!token) {
+        return false;
+    }
+    if (token.token_permission) {
+        return true;
+    }
+    return isScopeRestricted(token.app) || isScopeRestricted(token.endpoint);
+};
+
+/**
+* Every app id referenced by a permission object.
+* @param {object} permission - permission object ({_:{a,u}, c/r/u/d:{appId:...}})
+* @returns {string[]} list of app ids
+*/
+exports.getPermissionApps = function(permission) {
+    return principalApps({permission: permission});
+};
+
+/**
+* Bound a member by a token's permissions, returning a member that holds only what both allow.
+*
+* The subset check at creation time bounds a token to its creator, but the owner's own
+* permissions can be reduced afterwards, so the intersection is recomputed on every request.
+* The returned member never carries global_admin: that is precisely the authority a scoped token
+* was narrowed away from, and leaving it set would let every global_admin check bypass the scope.
+* @param {object} member - member document for the token owner
+* @param {object} tokenPermission - permission object stored on the token
+* @returns {object} a copy of the member holding only the intersection
+*/
+exports.intersectPermission = function(member, tokenPermission) {
+    var scoped = Object.assign({}, member);
+    scoped.global_admin = false;
+    //the legacy arrays are an alternative expression of authority, so they cannot be carried over
+    delete scoped.admin_of;
+    delete scoped.user_of;
+
+    var result = {_: {a: [], u: [[]]}, c: {}, r: {}, u: {}, d: {}};
+    var tokenPrincipal = {permission: tokenPermission};
+    var userApps = [];
+    var memberApps = principalApps(member);
+    //membership is granted by the owner's own membership, never by a feature it happens to hold:
+    //validateUserForRead and validateUserForWrite authorize on membership alone, so a token that
+    //picked it up from a feature grant would read apps its owner is refused on
+    var memberMemberApps = principalMemberApps(member);
+    var tokenAdminApps = (tokenPermission._ && Array.isArray(tokenPermission._.a)) ? tokenPermission._.a : [];
+    var tokenUserApps = [];
+    if (tokenPermission._ && Array.isArray(tokenPermission._.u)) {
+        for (var g = 0; g < tokenPermission._.u.length; g++) {
+            tokenUserApps = tokenUserApps.concat(tokenPermission._.u[g] || []);
+        }
+    }
+
+    grantingApps(tokenPermission).forEach(function(appId) {
+        //an app the owner can no longer reach grants the token nothing, whatever the token says
+        if (!member.global_admin && memberApps.indexOf(appId) === -1) {
+            return;
+        }
+        var grantsAnything = false;
+        for (var t = 0; t < PERMISSION_TYPES.length; t++) {
+            var type = PERMISSION_TYPES[t];
+            var tokenAll = principalAllowsAll(tokenPrincipal, type, appId);
+            if (tokenAll && principalAllowsAll(member, type, appId)) {
+                result[type][appId] = {all: true, allowed: {}};
+                grantsAnything = true;
+                continue;
+            }
+            //whichever side is not "all" has a finite feature list, and that is what to walk
+            var candidates = tokenAll ? principalFeatures(member, type, appId) : principalFeatures(tokenPrincipal, type, appId);
+            var allowed = {};
+            var any = false;
+            candidates.forEach(function(feature) {
+                if (principalAllows(tokenPrincipal, type, appId, feature) && principalAllows(member, type, appId, feature)) {
+                    allowed[feature] = true;
+                    any = true;
+                }
+            });
+            if (any) {
+                result[type][appId] = {all: false, allowed: allowed};
+                grantsAnything = true;
+            }
+        }
+        //membership of either kind is granted only where the owner is itself a member. hasAdminAccess
+        //alone is not enough for the admin branch: it also says yes to four all:true entries on an
+        //app absent from the owner's _.u/_.a, and an admin app is membership too
+        var ownerIsMember = member.global_admin || memberMemberApps.indexOf(appId) !== -1;
+        var isAdmin = tokenAdminApps.indexOf(appId) !== -1 && exports.hasAdminAccess(member, appId) && ownerIsMember;
+        if (isAdmin) {
+            result._.a.push(appId);
+        }
+        else if ((grantsAnything || tokenUserApps.indexOf(appId) !== -1) && ownerIsMember) {
+            //an app the token grants anything on - or names as a user app - stays visible, but
+            //only while the owner is a member of it too
+            userApps.push(appId);
+        }
+    });
+
+    result._.u = [userApps];
+    scoped.permission = result;
+    return scoped;
+};
+
+exports.getUserApps = function(member) {
+    let userApps = [];
+    if (member.global_admin) {
+        return userApps;
+    }
+    else {
+        if (typeof member.permission !== "undefined") {
+            var lists = (member.permission && member.permission._) || {};
+            var userOf = Array.isArray(lists.u) ? lists.u : [];
+            for (var i = 0; i < userOf.length; i++) {
+                userApps = userApps.concat(userOf[i] || []);
+            }
+            return userApps.concat(Array.isArray(lists.a) ? lists.a : []);
+        }
+        else {
+            return member.user_of;
+        }
+    }
+};
+
+exports.getUserAppsForFeaturePermission = function(member, feature, permissionType) {
+    let userApps = [];
+    if (member.global_admin) {
+        return userApps;
+    }
+    if (typeof member.permission !== "undefined") {
+        const permissionList = member.permission[permissionType];
+        for (var appId in permissionList) {
+            const targetPermissionForApp = permissionList[appId];
+            if (targetPermissionForApp.all === true || targetPermissionForApp.allowed[feature] === true) {
+                userApps.push(appId);
+            }
+        }
+    }
+    return userApps;
+};
+
+exports.getAdminApps = function(member) {
+    if (member.global_admin) {
+        return [];
+    }
+    else {
+        if (typeof member.permission !== "undefined") {
+            var lists = (member.permission && member.permission._) || {};
+            return Array.isArray(lists.a) ? lists.a : [];
+        }
+        else {
+            return member.admin_of;
+        }
+    }
+};

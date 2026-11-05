@@ -1,0 +1,18 @@
+<div v-bind:class="[componentId]">
+  <cly-header
+    :title="i18n('devices.devices-and-types.title')"
+    :tooltip="{description}"
+  >
+		<template v-slot:header-right>
+          <cly-more-options v-if="topDropdown" size="small">
+            <el-dropdown-item :key="idx" v-for="(item, idx) in topDropdown" :command="{url: item.value}">{{item.label}}</el-dropdown-item>
+          </cly-more-options>
+        </template>
+		 <template v-slot:header-tabs>
+            <cly-dynamic-tabs v-model="dynamicTab" skin="secondary" :tabs="tabs">
+            </cly-dynamic-tabs>
+        </template>
+    </cly-header>
+</div>
+
+

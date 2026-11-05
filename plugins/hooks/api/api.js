@@ -1,0 +1,1029 @@
+const Triggers = require('./parts/triggers/index.js');
+const InternalEventTrigger = require('./parts/triggers/internal_event.js');
+const Effects = require('./parts/effects/index.js');
+const asyncLib = require('async');
+const EventEmitter = require('events');
+const common = require('../../../api/utils/common.js');
+const { validateRead, validateCreate, validateDelete, validateUpdate } = require('../../../api/utils/rights.js');
+const plugins = require('../../pluginManager.js');
+const log = common.log('hooks:api');
+const _ = require('lodash');
+const utils = require('./utils');
+const rights = require('../../../api/utils/rights');
+const ssrfProtection = require('../../../api/utils/ssrf-protection');
+
+const FEATURE_NAME = 'hooks';
+
+/**
+ * Check that the member holds the given right for every app a hook targets.
+ * Hook write endpoints authorize against params.qstring.app_id only, so the
+ * apps actually affected by the operation must be re-checked to prevent a
+ * user with hooks rights on one app from touching hooks of another app.
+ * @param {Function} rightFn - rights.hasCreateRight/hasUpdateRight/hasDeleteRight
+ * @param {object} member - request member object
+ * @param {Array} apps - app ids the hook targets
+ * @returns {boolean} true only if member has the right for every app
+ */
+function memberHasRightForAllApps(rightFn, member, apps) {
+    if (!Array.isArray(apps) || apps.length === 0) {
+        return false;
+    }
+    return apps.every(function(appId) {
+        return rightFn(FEATURE_NAME, appId + "", member);
+    });
+}
+
+plugins.setConfigs("hooks", {
+    batchActionSize: 0, // size for processing actions each time
+    refreshRulesPeriod: 3000, // miliseconds to fetch hook records
+    pipelineInterval: 1000, // milliseconds to batch process pipeline
+    requestLimit: 0, //maximum request that can be handled in given time frame. 0 means no rate limit applied
+    timeWindowForRequestLimit: 60000, //time window for request limits in milliseconds
+});
+
+global.triggerRequestCount = [];
+
+/**
+* Hooks Class definition 
+*/
+class Hooks {
+    /**
+     *  Init Hooks Configuration
+     */
+    constructor() {
+        this._cachedRules = [];
+        this._triggers = {};
+        this._effects = {};
+        this._queue = [];
+
+        this.ensureEndpointPathIndex();
+        this.fetchRules();
+        setInterval(() => {
+            this.fetchRules();
+        }, plugins.getConfig("hooks").refreshRulesPeriod);
+        this.registerEffects();
+        this.registerTriggers();
+
+        this._queueEventEmitter = new EventEmitter();
+        this._queueEventEmitter.on('push', (data) => {
+            this._queue.push(data);
+        });
+        this._queueEventEmitter.on('pipe', () => {
+            this.pipeEffects();
+        });
+        this._queueEventEmitter.emit("pipe");
+    }
+
+    /**
+    *  Regist triggers 
+    */
+    registerTriggers() {
+        for (let type in Triggers) {
+            const t = new Triggers[type]({
+                pipeline: (data) => {
+                    this._queueEventEmitter.emit('push', data);
+                    plugins.dispatch("/hooks/trigger", data);
+                }
+            });
+            this._triggers[type] = t;
+        }
+    }
+
+    /**
+    *  Regist effects 
+    */
+    registerEffects() {
+        for (let type in Effects) {
+            const t = new Effects[type]();
+            this._effects[type] = t;
+        }
+    }
+
+    /**
+     * Keep api endpoint paths unique at the database level.
+     *
+     * Saving already refuses a path another hook holds, but that check is a read followed by a
+     * write, so two saves racing can still slip a duplicate through. A unique index closes
+     * that, and costs nothing at dispatch since rules are served from cache.
+     *
+     * Partial, so it constrains only api endpoint hooks: every other trigger type has no path
+     * and would otherwise collide on null. Instances that already hold a duplicate cannot build
+     * it, and that is deliberate rather than handled: the error is logged and everything carries
+     * on working, with the save-time check still preventing new duplicates. Nothing breaks, and
+     * the collision is resolved at dispatch by serving the older hook.
+     *
+     * @returns {void}
+     */
+    ensureEndpointPathIndex() {
+        common.db.collection("hooks").createIndex(
+            {"trigger.configuration.path": 1},
+            {
+                unique: true,
+                name: "hooks_api_endpoint_path_unique",
+                partialFilterExpression: {"trigger.type": "APIEndPointTrigger"}
+            },
+            function(err) {
+                if (err) {
+                    log.w("Could not create the unique index on api endpoint paths, most likely because two hooks already share one. New duplicates are still refused on save. %j", err.message || err);
+                }
+            }
+        );
+    }
+
+    /**
+    *  fetch hook records from db 
+    */
+    fetchRules() {
+        const self = this;
+        const db = common.db;
+        db && db.collection("hooks").find({"enabled": true}, {error_logs: 0}).toArray(function(err, result) {
+            log.d("Fetch rules:", result, err, process.pid);
+            if (result) {
+                //change profile group triggers to cohorts triggers. There are no events which starts with /profile-group, in reality it is just cohort events 
+                for (var z = 0; z < result.length; z++) {
+                    if (result[z].trigger && result[z].trigger.type === "InternalEventTrigger" && result[z].trigger.configuration && result[z].trigger.configuration.eventType) {
+                        if (result[z].trigger.configuration.eventType === "/profile-group/enter") {
+                            result[z].trigger.configuration.eventType = "/cohort/enter";
+                        }
+                        else if (result[z].trigger.configuration.eventType === "/profile-group/exit") {
+                            result[z].trigger.configuration.eventType = "/cohort/exit";
+                        }
+                    }
+                }
+                self._cachedRules = result;
+                self.syncRulesWithTrigger();
+            }
+        });
+    }
+
+    /**
+     * sync hook record intervally
+     */
+    syncRulesWithTrigger() {
+        for (let type in this._triggers) {
+            const t = this._triggers[type];
+            if (typeof t.syncRules === "function") {
+                t.syncRules(this._cachedRules);
+            }
+        }
+    }
+
+    /**
+     * process pipeline data
+     */
+    async pipeEffects() {
+        log.d("Process::", process.pid, ":::", this._queue.length);
+        try {
+
+            let batchActionSize = plugins.getConfig("hooks").batchActionSize;
+            if (batchActionSize === 0) {
+                batchActionSize = 100;
+            }
+            log.d("chunk size:", batchActionSize);
+
+            const chunk = this._queue.splice(0, batchActionSize);
+            await asyncLib.mapLimit(chunk, batchActionSize, async(item, callback) => {
+                log.d("get chunked item:", item);
+                // old trigger effects logic
+                if (item.effect) {
+                    if (this._effects[item.effect.type]) {
+                        //this._effects[item.effect.type].run(item);
+                    }
+                }
+                else {
+                    const rule = item.rule;
+
+                    //rate limiter
+                    if (checkRateLimitReached(rule)) {
+                        log.e("[call limit reached]", `call limit reached for ${rule._id}`);
+                        utils.addErrorRecord(rule._id, `call limit reached for ${rule._id}`);
+                        if (callback) {
+                            callback();
+                        }
+                        return;
+                    }
+
+                    for (let i = 0; i < rule.effects.length; i++) {
+
+                        item.effect = rule.effects[i];
+                        item.effectStep = i;
+                        item._originalInput = rule._originalInput;
+                        try {
+                            const result = await this._effects[item.effect.type].run(item);
+                            log.d("[test trigger result]", result);
+                        }
+                        catch (e) {
+                            log.e("[test hook trigger]", e);
+                            utils.addErrorRecord(rule._id, e);
+                        }
+                    }
+                }
+
+                if (callback) {
+                    callback();
+                }
+            });
+        }
+        catch (e) {
+            log.e("[hook test error]", e);
+        }
+
+        //check periodically
+        setTimeout(()=> {
+            this._queueEventEmitter.emit("pipe");
+        }, plugins.getConfig("hooks").pipelineInterval);
+    }
+}
+const checkRateLimitReached = function(rule) {
+
+    if (plugins.getConfig("hooks").requestLimit === 0) {
+        return false;
+    }
+
+    let requestCount = global.triggerRequestCount.find(item=> {
+        return item.ruleId.toString() === rule._id.toString();
+    });
+
+    if (!requestCount) { //no record in time interval
+        addInitialRequestCounter(rule); //add initial record for time window frame
+        return false;
+    }
+
+    return incrementRequestCounter(rule);
+
+
+};
+
+const addInitialRequestCounter = function(rule) {
+    let startTime = Date.now();
+    let endTime = startTime + plugins.getConfig("hooks").timeWindowForRequestLimit;
+    global.triggerRequestCount.push({ruleId: rule._id.toString(), startTime: startTime, endTime: endTime, counter: 1});
+};
+
+const incrementRequestCounter = function(rule) {
+    //delete records which are not in time frame
+    const currentTimestamp = Date.now();
+    global.triggerRequestCount = global.triggerRequestCount.filter(item => {
+        return currentTimestamp >= item.startTime && currentTimestamp <= item.endTime;
+    }); //we don't need to check the rule id. if timeframe is passed counter is also not valid for other rules
+
+    let counterIndex = global.triggerRequestCount.findIndex(item => {
+        return item.ruleId.toString() === rule._id.toString();
+    });
+    if (counterIndex < 0) {
+        return false;
+    }
+
+    global.triggerRequestCount[counterIndex].counter++;
+
+    return global.triggerRequestCount[counterIndex].counter > plugins.getConfig("hooks").requestLimit;
+
+};
+
+const CheckEffectProperties = function(effect) {
+    var rules = {};
+    //todo: add more validation for effect types
+    if (effect) {
+        if (effect.type === "HTTPEffect") {
+            rules.url = { 'required': true, 'type': 'URL' };
+            rules.headers = { 'required': false, 'type': 'Object' };
+        }
+    }
+    return rules;
+};
+
+const CheckHookProperties = function(hookConfig) {
+    const rules = {
+        'name': { 'required': hookConfig._id ? false : true, 'type': 'String', 'min-length': 1 },
+        'description': { 'required': false, 'type': 'String', 'min-length': 0 },
+        'apps': { 'required': hookConfig._id ? false : true, 'type': 'Array', 'min-length': 1 },
+        'trigger': { 'required': hookConfig._id ? false : true, 'type': 'Object'},
+        'effects': { 'required': hookConfig._id ? false : true, 'type': 'Array', 'min-length': 1},
+        'enabled': { 'required': hookConfig._id ? false : true, 'type': 'Boolean'}
+    };
+    return rules;
+};
+
+plugins.register("/permissions/features", function(ob) {
+    ob.features.push(FEATURE_NAME);
+});
+
+/**
+* @api {post} /i/hook/save create or update hook 
+* @apiName saveHook 
+* @apiGroup hooks 
+*
+* @apiDescription create or update hook data. 
+* @apiQuery {hook_config} JSON string of hook object.
+* @apiQuery {String} app_id target app id of the alert.  
+*
+* @apiSuccessExample {text} Success-Response:
+* HTTP/1.1 200 OK
+*
+* "6262779e46bd55a8c555cfb9"
+*
+*/
+plugins.register("/i/hook/save", function(ob) {
+    let paramsInstance = ob.params;
+
+    validateCreate(ob.params, FEATURE_NAME, async function(params) {
+        let hookConfig = params.qstring.hook_config;
+        if (!hookConfig) {
+            common.returnMessage(params, 400, 'Invalid hookConfig');
+            return true;
+        }
+
+        try {
+            hookConfig = JSON.parse(hookConfig);
+            common.stripRequestCredentials(hookConfig);
+            hookConfig = sanitizeConfig(hookConfig);
+            if (hookConfig) {
+                // Null check for hookConfig
+                if (!(common.validateArgs(hookConfig, CheckHookProperties(hookConfig)))) {
+                    common.returnMessage(params, 400, 'Not enough args');
+                    return true;
+                }
+
+                // Only global admins may create or update hooks that subscribe
+                // to global (non app-scoped) internal events such as
+                // /i/users/* or /systemlogs — these carry instance-wide data.
+                if (!params.member.global_admin
+                    && hookConfig.trigger
+                    && hookConfig.trigger.type === "InternalEventTrigger"
+                    && hookConfig.trigger.configuration
+                    && InternalEventTrigger.GLOBAL_EVENT_TYPES[hookConfig.trigger.configuration.eventType]) {
+                    common.returnMessage(params, 403, "User does not have right to subscribe to this event");
+                    return true;
+                }
+
+                if (hookConfig.effects) {
+                    const effectValidation = await validateEffects(hookConfig.effects);
+                    if (!effectValidation.valid) {
+                        common.returnMessage(params, 400, effectValidation.error || 'Invalid configuration for effects');
+                        return true;
+                    }
+                }
+
+                if (hookConfig._id) {
+                    const id = hookConfig._id;
+                    delete hookConfig._id;
+                    const existingHook = await common.db.collection("hooks").findOne({ _id: common.db.ObjectID(id) });
+                    if (!existingHook) {
+                        common.returnMessage(params, 404, "Hook not found");
+                        return true;
+                    }
+                    // must be allowed to update the hook's current apps, and any
+                    // new set of apps it is being retargeted to
+                    if (!params.member.global_admin &&
+                        (!memberHasRightForAllApps(rights.hasUpdateRight, params.member, existingHook.apps) ||
+                            (hookConfig.apps && !memberHasRightForAllApps(rights.hasUpdateRight, params.member, hookConfig.apps)))) {
+                        common.returnMessage(params, 403, "User does not have right");
+                        return true;
+                    }
+                    //validate against the effective hook, since an update may
+                    //change only the trigger or only the apps
+                    const updatedTriggerValidation = await validateTriggerConfiguration(
+                        hookConfig.trigger || existingHook.trigger,
+                        hookConfig.apps || existingHook.apps,
+                        existingHook._id
+                    );
+                    if (!updatedTriggerValidation.valid) {
+                        common.returnMessage(params, 400, updatedTriggerValidation.error);
+                        return true;
+                    }
+                    return common.db.collection("hooks").findAndModify(
+                        { _id: common.db.ObjectID(id) },
+                        {},
+                        //also clears a credential stored before this was fixed: $set
+                        //leaves a field it does not name exactly as it was
+                        common.unsetRequestCredentials({$set: hookConfig}),
+                        {new: true},
+                        function(err, result) {
+                            if (!err) {
+                                // Audit log: Hook updated
+                                if (result && result.value) {
+                                    plugins.dispatch("/systemlogs", {
+                                        params: params,
+                                        action: "hook_updated",
+                                        data: {
+                                            updatedHookID: result.value._id,
+                                            updatedBy: params.member._id,
+                                            updatedHookName: result.value.name
+                                        }
+                                    });
+                                }
+                                else {
+                                    common.returnMessage(params, 500, "No result found");
+                                }
+                                common.returnOutput(params, result && result.value);
+                            }
+                            else {
+                                common.returnMessage(params, 500, "Failed to save an hook");
+                            }
+                        }
+                    );
+                }
+
+            }
+            if (hookConfig) {
+                hookConfig.createdBy = params.member._id; // Accessing property now with proper check
+                hookConfig.created_at = new Date().getTime();
+            }
+            // a new hook may only target apps the caller can create hooks on
+            if (!params.member.global_admin && !memberHasRightForAllApps(rights.hasCreateRight, params.member, hookConfig.apps)) {
+                common.returnMessage(params, 403, "User does not have right");
+                return true;
+            }
+
+            const newTriggerValidation = await validateTriggerConfiguration(hookConfig.trigger, hookConfig.apps);
+            if (!newTriggerValidation.valid) {
+                common.returnMessage(params, 400, newTriggerValidation.error);
+                return true;
+            }
+            return common.db.collection("hooks").insert(
+                hookConfig,
+                function(err, result) {
+                    log.d("insert new hook:", err, result);
+                    if (!err && result && result.insertedIds && result.insertedIds[0]) {
+                        // Audit log: Hook created
+                        plugins.dispatch("/systemlogs", {
+                            params: params,
+                            action: "hook_created",
+                            data: {
+                                createdHookID: hookConfig._id,
+                                createdBy: params.member._id,
+                                createdHookName: hookConfig.name
+                            }
+                        });
+                        common.returnOutput(params, result.insertedIds[0]);
+                    }
+                    else {
+                        common.returnMessage(params, 500, "Failed to create an hook");
+                    }
+                }
+            );
+        }
+        catch (err) {
+            //the error itself was dropped here, so every failure in this block looked alike
+            //from the logs - which is how the sanitizeConfig throw above went unnoticed
+            log.e('Parse hook failed', hookConfig, err);
+            common.returnMessage(params, 500, "Failed to create an hook");
+        }
+    }, paramsInstance);
+    return true;
+});
+
+/**
+ * Validate a trigger's configuration: an APIEndPointTrigger's path must be unused, and an
+ * InternalEventTrigger's event type must be known and scoped to the hook's own apps.
+ *
+ * The event type itself was never checked, so any string was accepted and stored.
+ * More importantly, the events that name a target object matched on that id alone
+ * at delivery time, with nothing tying the target to the hook's apps: a hook
+ * scoped to one app could name another app's cohort, hook or alert. Delivery is
+ * now scoped, so this is a second line of defence, but it turns a hook that would
+ * silently never fire into an explicit rejection at save time.
+ *
+ * hooks and alerts are core collections, so a target that cannot be resolved is
+ * rejected. Cohorts are an enterprise plugin and the collection may not exist in
+ * a given deployment, so an unresolvable cohort is allowed through and left to the
+ * delivery-time check rather than blocking a working feature.
+ *
+ * @param {object} trigger - the effective trigger, payload merged over stored
+ * @param {array} apps - the effective app ids the hook is scoped to
+ * @param {ObjectID} [hookId] - the hook being updated, so it does not clash with itself
+ * @returns {Promise<object>} {valid, error}
+ */
+async function validateTriggerConfiguration(trigger, apps, hookId) {
+    if (trigger && trigger.type === "APIEndPointTrigger") {
+        //Endpoint paths are global while hooks belong to apps, so nothing stops a hook on
+        //one app claiming a path already used by a hook on another. Dispatch matches on the
+        //path alone, so a second claimant receives the first one's callback parameters and
+        //the first one stops firing. Keep paths unique instead.
+        const path = (trigger.configuration || {}).path;
+        if (!path) {
+            return {valid: false, error: "Missing path for this trigger type"};
+        }
+        const clash = {"trigger.type": "APIEndPointTrigger", "trigger.configuration.path": path + ""};
+        if (hookId) {
+            //an update must not collide with the hook it is updating
+            clash._id = {$ne: hookId};
+        }
+        const taken = await common.db.collection("hooks").findOne(clash, {projection: {_id: 1}});
+        if (taken) {
+            return {valid: false, error: "This endpoint path is already in use. Choose another path."};
+        }
+        return {valid: true};
+    }
+    if (!trigger || trigger.type !== "InternalEventTrigger") {
+        return {valid: true};
+    }
+
+    const configuration = trigger.configuration || {};
+    const eventType = configuration.eventType;
+
+    if (!eventType || InternalEventTrigger.getInternalEvents().indexOf(eventType) === -1) {
+        return {valid: false, error: "Unknown internal event type"};
+    }
+
+    const scopedApps = Array.isArray(apps) ? apps.map(function(a) {
+        return a + "";
+    }) : [];
+
+    if (eventType === "/cohort/enter" || eventType === "/cohort/exit") {
+        if (!configuration.cohortID) {
+            return {valid: false, error: "Missing cohort for this event type"};
+        }
+        let cohort = null;
+        try {
+            //cohort ids are stored as strings, and the collection belongs to an
+            //enterprise plugin that may not be installed
+            cohort = await common.db.collection("cohorts").findOne({_id: configuration.cohortID + ""});
+        }
+        catch (e) {
+            //an unresolvable cohort is allowed through on purpose (see above), so
+            //log why rather than letting the reason disappear
+            log.d("Could not resolve cohort " + configuration.cohortID + " while validating a hook trigger: " + e.message);
+            cohort = null;
+        }
+        if (cohort && scopedApps.indexOf(cohort.app_id + "") === -1) {
+            return {valid: false, error: "Cohort does not belong to this hook's apps"};
+        }
+        return {valid: true};
+    }
+
+    if (eventType === "/hooks/trigger") {
+        if (!configuration.hookID) {
+            return {valid: false, error: "Missing hook for this event type"};
+        }
+        let sourceHook = null;
+        try {
+            sourceHook = await common.db.collection("hooks").findOne({_id: common.db.ObjectID(configuration.hookID + "")});
+        }
+        catch (e) {
+            //a malformed id lands here and is rejected below, which is correct, but
+            //the caller sees only "does not belong to this hook's apps" so record why
+            log.d("Could not resolve source hook " + configuration.hookID + " while validating a hook trigger: " + e.message);
+            sourceHook = null;
+        }
+        //the source hook's payload includes its whole document, so require it to be
+        //scoped within this hook's apps rather than merely overlapping
+        const sourceApps = (sourceHook && Array.isArray(sourceHook.apps)) ? sourceHook.apps : null;
+        if (!sourceApps || !sourceApps.length || !sourceApps.every(function(a) {
+            return scopedApps.indexOf(a + "") > -1;
+        })) {
+            return {valid: false, error: "Source hook does not belong to this hook's apps"};
+        }
+        return {valid: true};
+    }
+
+    if (eventType === "/alerts/trigger" && configuration.alertID) {
+        let alert = null;
+        try {
+            alert = await common.db.collection("alerts").findOne({_id: common.db.ObjectID(configuration.alertID + "")});
+        }
+        catch (e) {
+            //as above: a malformed id is rejected below, so record the real reason
+            log.d("Could not resolve alert " + configuration.alertID + " while validating a hook trigger: " + e.message);
+            alert = null;
+        }
+        const alertApps = (alert && Array.isArray(alert.selectedApps)) ? alert.selectedApps : [];
+        if (!alert || !alertApps.some(function(a) {
+            return scopedApps.indexOf(a + "") > -1;
+        })) {
+            return {valid: false, error: "Alert does not belong to this hook's apps"};
+        }
+    }
+
+    return {valid: true};
+}
+
+/***
+ * @param {array} effects - array of effects
+ */
+async function validateEffects(effects) {
+    if (effects) {
+        for (let i = 0; i < effects.length; i++) {
+            if (!(common.validateArgs(effects[i].configuration, CheckEffectProperties(effects[i])))) {
+                return { valid: false, error: 'Invalid effect configuration' };
+            }
+
+            // SSRF protection: validate HTTPEffect URLs with DNS resolution
+            if (effects[i].type === "HTTPEffect" && effects[i].configuration && effects[i].configuration.url) {
+                const urlCheck = await ssrfProtection.isUrlSafe(effects[i].configuration.url);
+                if (!urlCheck.safe) {
+                    return { valid: false, error: 'Unsafe URL in HTTPEffect: ' + urlCheck.error };
+                }
+            }
+        }
+    }
+
+    return { valid: true, error: null };
+
+}
+
+
+
+/**
+ * build mongodb query for app level permission control
+ * @param {objext} query - init mongodb query object
+ * @param {object} params - countly params from requested upstream
+ * @returns  {object} newQuery - new query object
+ */
+function getVisibilityQuery(query, params) {
+    let member = params.member;
+    rights.getUserAppsForFeaturePermission(member, FEATURE_NAME, 'r');
+
+    if (member.global_admin) {
+        return query;
+    }
+    let newQuery = _.extend({}, query);
+
+    newQuery.$or = [
+        {apps: {$in: rights.getAdminApps(member) || []}},
+        {apps: {$in: rights.getUserAppsForFeaturePermission(member, FEATURE_NAME, 'r') || []}}
+    ];
+    return newQuery;
+}
+/**
+ * 
+ * @param {hookConfig} hookConfig - hook config
+ * @returns {sanitizedHookConfig} - sanitized hook config
+ */
+function sanitizeConfig(hookConfig) {
+    if (hookConfig && Array.isArray(hookConfig.effects)) {
+        //every email effect, not just the first one findIndex stops at: a hook may carry
+        //several, and the ones after the first were reaching the database unsanitized
+        hookConfig.effects.forEach(function(effect) {
+            if (!effect || effect.type !== "EmailEffect" || !effect.configuration) {
+                return;
+            }
+            //an email effect without a template is a supported configuration - the effect
+            //falls back to a formatted dump of the trigger payload - but sanitizeHTML reads
+            //.replace off whatever it is given, so passing undefined threw and the save
+            //answered 500, making that configuration impossible to store
+            if (typeof effect.configuration.emailTemplate === "string") {
+                effect.configuration.emailTemplate = common.sanitizeHTML(effect.configuration.emailTemplate);
+            }
+        });
+    }
+    return hookConfig;
+
+}
+
+
+/**
+* @api {post} /i/hook/list list hooks
+* @apiName getHooks 
+* @apiGroup hooks 
+*
+* @apiDescription get hook list. 
+* @apiQuery {String} app_id for permission checking  
+*
+* @apiSuccessExample {json} Success-Response:
+* HTTP/1.1 200 OK
+*
+* {
+      "hooksList": [
+        {
+          "_id": "6262779e46bd55a8c555cfb9",
+          "name": "test",
+          "description": "test",
+          "apps": [
+            "610cea5f6229f9e738d30d0a"
+          ],
+          "trigger": {
+            "type": "APIEndPointTrigger",
+            "configuration": {
+              "path": "ede612bd-f82f-452b-bae0-efde0b7a7caa",
+              "method": "get"
+            }
+          },
+          "createdBy": "60afbaa84723f369db477fee",
+          "createdByUser": "foobar",
+          "effects": [
+            {
+              "type": "EmailEffect",
+              "configuration": {
+                "address": [
+                  "test@test.com"
+                ],
+                "emailTemplate": "test"
+              }
+            }
+          ],
+          "enabled": true,
+          "created_at": 1650620318327
+        }
+      ]
+    }
+*
+*/
+plugins.register("/o/hook/list", function(ob) {
+    const paramsInstance = ob.params;
+
+    validateRead(paramsInstance, FEATURE_NAME, function(params) {
+        try {
+
+            let query = { $query: getVisibilityQuery({}, paramsInstance), $orderby: { created_at: -1 } };
+
+            if (paramsInstance.qstring && paramsInstance.qstring.id) {
+                query.$query._id = common.db.ObjectID(paramsInstance.qstring.id);
+            }
+            common.db.collection("hooks").find(query.$query).sort(query.$orderby).toArray(function(err, hooksList) {
+                if (err) {
+                    common.returnOutput(params, []);
+                    return log.e('got error in listing hooks: %j', err);
+                }
+                common.db.collection('members').find({}).toArray(function(err2, members) {
+                    if (err2) {
+                        common.returnOutput(params, []);
+                        return log.e('got error in finding members: %j', err2);
+                    }
+                    hooksList.forEach((a) => {
+                        const member = _.find(members, {_id: a.createdBy});
+                        a.createdByUser = member && member.full_name;
+                    });
+                    common.returnOutput(params, { hooksList });
+                });
+            });
+        }
+        catch (err) {
+            log.e('get hook list failed', err);
+            common.returnMessage(params, 500, "Failed to get hook list" + err.message);
+        }
+    }, paramsInstance);
+    return true;
+});
+
+
+/**
+ * @api {post} /i/hook/status change hook status
+ * @apiName changeHookStatus 
+ * @apiGroup hooks 
+ *
+ * @apiDescription change hooks status by boolean flag.
+ * @apiQuery {string} JSON string of status object for alerts record want to update.
+ *  for example: {"626270afbf7392a8bfd8c1f3":false, "42dafbf7392a8bfd8c1e1": true}
+ * @apiQuery {String} app_id target app id of the alert.  
+ *
+ * @apiSuccessExample {text} Success-Response:
+ * HTTP/1.1 200 OK
+ *
+ * true
+ *
+*/
+plugins.register("/i/hook/status", function(ob) {
+    let paramsInstance = ob.params;
+
+    validateUpdate(paramsInstance, FEATURE_NAME, function(params) {
+        let statusList;
+        try {
+            statusList = JSON.parse(params.qstring.status);
+        }
+        catch {
+            common.returnMessage(params, 400, "Invalid status payload");
+            return;
+        }
+        if (!statusList || typeof statusList !== "object" || Array.isArray(statusList)) {
+            common.returnMessage(params, 400, "Invalid status payload");
+            return;
+        }
+        const hookIds = Object.keys(statusList);
+        let objectIds;
+        try {
+            objectIds = hookIds.map(function(id) {
+                return common.db.ObjectID(id);
+            });
+        }
+        catch {
+            common.returnMessage(params, 400, "Invalid hook id");
+            return;
+        }
+        //statusList is keyed by hook _id; verify the caller may update every
+        //affected hook (across its apps) before toggling any of them
+        common.db.collection("hooks").find({ _id: { $in: objectIds } }, { projection: { apps: 1 } }).toArray(function(findErr, hooksFound) {
+            if (findErr) {
+                log.e('Failed to load hooks for status update: ', findErr);
+                common.returnMessage(params, 500, "Failed to update hook statuses");
+                return;
+            }
+            var allowed = !params.member.global_admin
+                ? (hooksFound.length === hookIds.length && hooksFound.every(function(h) {
+                    return memberHasRightForAllApps(rights.hasUpdateRight, params.member, h.apps);
+                }))
+                : true;
+            if (!allowed) {
+                common.returnMessage(params, 403, "User does not have right");
+                return;
+            }
+            const batch = [];
+            for (const hookId in statusList) {
+                batch.push(
+                    common.db.collection("hooks").findAndModify(
+                        { _id: common.db.ObjectID(hookId) },
+                        {},
+                        { $set: { enabled: statusList[hookId] } },
+                        { new: false, upsert: false }
+                    )
+                );
+            }
+            Promise.all(batch).then(function() {
+                log.d("hooks all updated.");
+                // Audit log: Hook status updated
+                plugins.dispatch("/systemlogs", {
+                    params: params,
+                    action: "hook_status_updated",
+                    data: { updatedHooksCount: Object.keys(statusList).length, requestedBy: params.member._id }
+                });
+                common.returnOutput(params, true);
+            }).catch(function(err) {
+                log.e('Failed to update hook statuses: ', err);
+                common.returnMessage(params, 500, "Failed to update hook statuses: " + err.message);
+            });
+        });
+    }, paramsInstance);
+    return true;
+});
+
+
+
+/**
+ * @api {post} /i/hook/delete delete hook by alert ID 
+ * @apiName deleteHook
+ * @apiGroup hooks 
+ *
+ * @apiDescription delete hook by id.
+ * @apiQuery {string} hookID target hook id from db.
+ * @apiQuery {String} app_id target app id of the alert.  
+ *
+ * @apiSuccessExample {json} Success-Response:
+ * HTTP/1.1 200 OK
+ *
+ * {"result":"Deleted an hook"}
+ *
+*/
+plugins.register("/i/hook/delete", function(ob) {
+    let paramsInstance = ob.params;
+
+    validateDelete(paramsInstance, FEATURE_NAME, function(params) {
+        let hookID = params.qstring.hookID;
+        let objId;
+        try {
+            objId = common.db.ObjectID(hookID);
+        }
+        catch {
+            common.returnMessage(params, 400, "Invalid hook id");
+            return;
+        }
+        //load the hook first so its apps can be authorized; the request was
+        //only validated against params.qstring.app_id, not the hook's apps
+        common.db.collection("hooks").findOne({ "_id": objId }, function(findErr, hook) {
+            if (findErr) {
+                log.e('delete hook failed', hookID, findErr);
+                common.returnMessage(params, 500, "Failed to delete an hook");
+                return;
+            }
+            if (!hook) {
+                common.returnMessage(params, 404, "Hook not found");
+                return;
+            }
+            if (!params.member.global_admin && !memberHasRightForAllApps(rights.hasDeleteRight, params.member, hook.apps)) {
+                common.returnMessage(params, 403, "User does not have right");
+                return;
+            }
+            common.db.collection("hooks").remove(
+                { "_id": objId },
+                function(err, result) {
+                    log.d(err, result, "delete an hook");
+                    if (!err) {
+                        // Audit log: Hook deleted
+                        plugins.dispatch("/systemlogs", {
+                            params: params,
+                            action: "hook_deleted",
+                            data: {
+                                deletedHookID: hookID,
+                                requestedBy: params.member._id
+                            }
+                        });
+                        common.returnMessage(params, 200, "Deleted an hook");
+                    }
+                    else {
+                        common.returnMessage(params, 500, "Failed to delete a hook: " + err.message);
+                    }
+                }
+            );
+        });
+    }, paramsInstance);
+    return true;
+});
+
+//  test hook with mock hook config data
+plugins.register("/i/hook/test", function(ob) {
+    const paramsInstance = ob.params;
+
+    validateCreate(paramsInstance, FEATURE_NAME, async(params) => {
+        let hookConfig = params.qstring.hook_config;
+        if (!hookConfig) {
+            common.returnMessage(params, 400, 'Invalid hookConfig');
+            return;
+        }
+
+        try {
+            hookConfig = JSON.parse(hookConfig);
+            if (!hookConfig) {
+                common.returnMessage(params, 400, 'Parsed hookConfig is invalid');
+                return;
+            }
+            hookConfig = sanitizeConfig(hookConfig);
+            const mockData = JSON.parse(params.qstring.mock_data);
+
+            if (!(common.validateArgs(hookConfig, CheckHookProperties(hookConfig)))) {
+                common.returnMessage(params, 403, "hook config invalid" + JSON.stringify(hookConfig));
+                return; // Add return to exit early
+            }
+
+            // Null check for effects
+            if (hookConfig.effects) {
+                const effectValidation = await validateEffects(hookConfig.effects);
+                if (!effectValidation.valid) {
+                    common.returnMessage(params, 400, effectValidation.error || 'Config invalid');
+                    return; // Add return to exit early
+                }
+            }
+
+            // a user may only test a hook for apps they could actually manage;
+            // validateCreate above only checked the request app_id, so re-check
+            // every app the hook targets to keep test from running effects (or
+            // probing data) against apps the member has no hooks rights on
+            if (!params.member.global_admin && !memberHasRightForAllApps(rights.hasCreateRight, params.member, hookConfig.apps)) {
+                common.returnMessage(params, 403, "User does not have right");
+                return;
+            }
+
+
+            // trigger process            
+            log.d(JSON.stringify(hookConfig), "[hook test config]");
+            const results = [];
+
+            // build mock data
+            const trigger = hookConfig.trigger;
+            if (!trigger) {
+                common.returnMessage(params, 400, 'Trigger is missing');
+                return;
+            }
+            hookConfig._id = null;
+
+            log.d("[hook test mock data]", mockData);
+            const obj = {
+                is_mock: true,
+                params: mockData,
+                rule: hookConfig
+            };
+            log.d("[hook test config data]", obj);
+            const t = new Triggers[trigger.type]({
+                rules: [hookConfig],
+            });
+
+            // output trigger result
+            const triggerResult = await t.process(obj);
+            log.d("[hook trigger test result]", triggerResult);
+            results.push(JSON.parse(JSON.stringify(triggerResult)));
+
+            // call effect loop
+            const effects = hookConfig.effects;
+            for (let i = 0; i < effects.length; i++) {
+                let effectResult = {};
+                const effect = new Effects[effects[i].type]();
+                let lastStep = JSON.parse(JSON.stringify(results[results.length - 1]));
+                lastStep.effect = effects[i];
+                try {
+                    effectResult = await effect.run(lastStep);
+                    results.push(JSON.parse(JSON.stringify(effectResult)));
+                    if (!effectResult || !effectResult.params) {
+                        common.returnMessage(params, 200, results);
+                        return;
+                    }
+                    log.d("[hook effect[i] test result]", effectResult, effects[i], i);
+                }
+                catch (e) {
+                    log.e("[hook effect[i] teste error]", e);
+                    effectResult.error = e;
+                }
+            }
+            log.d("[hook test results]", results);
+            common.returnMessage(params, 200, results);
+            return false;
+        }
+        catch (e) {
+            log.e("hook test error", e, hookConfig);
+            common.returnMessage(params, 503, "Hook test failed." + e.message);
+            return;
+        }
+    }, paramsInstance);
+    return true;
+});
+
+
+// init instnace;
+new Hooks();

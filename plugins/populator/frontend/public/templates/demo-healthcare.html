@@ -1,0 +1,78 @@
+<html>
+    <head>
+        <title>Countly Healthcare - Heatmap Demo</title>
+        <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.4.1/css/bootstrap.min.css" integrity="sha384-Vkoo8x4CGsO3+Hhxv8T/Q5PaXtkKtu6ug5TOeNV6gBiFeWPGFN9MuhOf23Q9Ifjh" crossorigin="anonymous">
+        <link rel="stylesheet" href="<%= countlyPath %>/populator/stylesheets/demo/healthcare.css">
+    </head>
+    <body>
+        <div class="container demo-healthcare">
+            <div class="row top-bar">
+                <div class="col-sm-3">
+                    <a href="demo-healthcare.html">
+                        <strong>Countly Healthcare</strong>
+                    </a>
+                </div>
+                <div class="col-sm-3">
+                </div>
+                <div class="col-sm-3 text-center">
+                    <a href="demo-healthcare-1.html">
+                        Our Hospitals
+                    </a>
+                </div>
+                <div class="col-sm-3 text-center">
+                    <a href="demo-healthcare-2.html">
+                        Online Appointment
+                    </a>
+                </div>
+            </div>
+            <div class="row search-bar">
+                <div class="col-sm-8 offset-sm-2">
+                    <input type="text" placeholder="what is your complaint" class="form-control">
+                </div>
+            </div>
+            <div class="row content">
+                <% if (pageIndex === '0') { %>
+                <% } else if (pageIndex === '1') { %>
+                <% } else if (pageIndex === '2') { %>
+                <% } %>
+                <% if (pageIndex === '0') { %>
+                    <div class="col-sm-4 offset-1 text-center">
+                        <h1>#stayAtHome<br>Countly<br>Online<br>Doctor<br>Consultation</h1>
+                    </div>
+                    <div class="col-sm-4 offset-1 text-center">
+                        <img src="<%= countlyPath %>/populator/images/healthcare.svg" style="width:100%">
+                    </div>
+                <% } else if (pageIndex === '1') { %>
+                    <div class="col-sm-12">
+                        <h1>Our Hospitals</h1>
+                        <%- include(includes.content3Cols); %>
+                    </div>
+                <% } else if (pageIndex === '2') { %>
+                    <div class="col-sm-12">
+                        <h1>Online Appointment</h1>
+                        <%- include(includes.content2Cols); %>
+                    </div>
+                <% } %>
+            </div>
+            <div class="container row footer">
+                <div class="col-sm">
+                    <a href="demo-healthcare-1.html">
+                        Our Hospitals
+                    </a>
+                </div>
+                <div class="col-sm">
+                    <a href="demo-healthcare-2.html">
+                        Online Appointment
+                    </a>
+                </div>
+                <div class="col-sm">
+                    Guest House
+                </div>
+                <div class="col-sm">
+                    Private Insurances
+                </div>
+            </div>
+        </div>
+        <%- include(includes.scripts); %>
+    </body>
+</html>

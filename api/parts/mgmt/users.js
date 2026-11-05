@@ -1,0 +1,1257 @@
+/**
+* This module is meant handling dashboard user accounts
+* @module api/parts/mgmt/users
+*/
+
+/** @lends module:api/parts/mgmt/users */
+var usersApi = {},
+    common = require('./../../utils/common.js'),
+    mail = require('./mail.js'),
+    countlyConfig = require('./../../../frontend/express/config.js'),
+    preventBruteforce = require('../../../frontend/express/libs/preventBruteforce.js'),
+    plugins = require('../../../plugins/pluginManager.js'),
+    { hasAdminAccess, getUserApps, getAdminApps, hasReadRight } = require('./../../utils/rights.js');
+
+const countlyCommon = require('../../lib/countly.common.js');
+const log = require('../../utils/log.js')('core:mgmt.users');
+const authorize = require('../../utils/authorizer.js');
+const _ = require('lodash');
+
+//for password checking when deleting own account. Could be removed after merging with next
+var argon2 = require('argon2');
+var crypto = require('crypto');
+/**
+* Get data about current user and output to browser
+* @param {params} params - params object
+* @returns {boolean} true
+**/
+usersApi.getCurrentUser = function(params) {
+    //Answer with a copy, so removing fields here cannot affect the member object the rest
+    //of the request still uses.
+    var member = Object.assign({}, params.member);
+
+    //The api_key is not scoped: it grants everything its owner can do, on every app they
+    //can reach. getUserById and getAllUsers already project it away, and the member event
+    //payloads delete it, so this was the one read path that handed it out. It matters here
+    //because a request can be authorized by a token rather than by the key itself, and a
+    //token can be limited to a single app, so returning the key would let a token that is
+    //limited to one app produce a credential that is limited to nothing. Anyone who needs
+    //their own key can still read it from the dashboard's /api-key route.
+    delete member.password;
+    delete member.api_key;
+    //Same reasoning for the second factor, whose secret lives on the member document: a
+    //response carrying both the key and the secret behind the factor protecting it protects
+    //nothing. The whole object goes, since this endpoint has no consumer that needs it and
+    //the enabled flag is available from the user listing.
+    delete member.two_factor_auth;
+
+    common.returnOutput(params, member);
+    return true;
+};
+
+/**
+* Get data about specific user by user id, and outputs to browser
+* @param {params} params - params object
+* @returns {boolean} true if fetched data from db
+**/
+usersApi.getUserById = function(params) {
+    if (!params.qstring.id) {
+        common.returnMessage(params, 401, 'Missing user id parameter');
+        return false;
+    }
+    common.db.collection('members').findOne({ _id: common.db.ObjectID(params.qstring.id) }, {
+        password: 0,
+        appSortList: 0,
+        api_key: 0
+    }, function(err, member) {
+
+        if (!member || err) {
+            common.returnOutput(params, {});
+            return false;
+        }
+
+        var memberObj = {};
+
+        member.global_admin = (member.global_admin === true);
+        member.locked = (member.locked === true);
+        member.created_at = member.created_at || 0;
+        member.last_login = member.last_login || 0;
+        member.is_current_user = (member.api_key === params.member.api_key);
+        memberObj[member._id] = member;
+
+        common.returnOutput(params, memberObj);
+    });
+    return true;
+};
+
+/**
+* Get list of all users, for global admins only, and outputs to browser
+* @param {params} params - params object
+* @returns {boolean} true if fetched data from db
+**/
+usersApi.getAllUsers = function(params) {
+    common.db.collection('members').find({}, {
+        password: 0,
+        appSortList: 0,
+        api_key: 0,
+    }).toArray(function(err, members) {
+
+        if (!members || err) {
+            common.returnOutput(params, {});
+            return false;
+        }
+
+
+
+        common.db.collection('failed_logins').find({}).toArray(function(err2, failedLogins) {
+            if (err2) {
+                common.returnOutput(params, {});
+                return false;
+            }
+            const bruteforceFails = plugins.getConfig("security").login_tries;
+            const bruteforceWait = plugins.getConfig("security").login_wait;
+
+            var membersObj = {};
+
+            for (let i = 0; i < members.length; i++) {
+                const counterIds = preventBruteforce.loginCounterIds(members[i].username);
+                const result = failedLogins.find(x => x._id === counterIds[0]) || failedLogins.find(x => x._id === counterIds[1]) || { fails: 0 };
+
+                if (result.fails > 0 && result.fails % bruteforceFails === 0 && Math.floor(new Date().getTime() / 1000) < (((result.fails / bruteforceFails) * bruteforceWait) + result.lastFail)) {
+                    members[i].blocked = true;
+                }
+                else {
+                    members[i].blocked = false;
+                }
+
+                members[i].global_admin = (members[i].global_admin === true);
+                members[i].locked = (members[i].locked === true);
+                members[i].created_at = members[i].created_at || 0;
+                members[i].last_login = members[i].last_login || 0;
+                members[i].is_current_user = (members[i].api_key === params.member.api_key);
+                membersObj[members[i]._id] = members[i];
+            }
+
+            common.returnOutput(params, membersObj);
+        });
+
+
+        return true;
+    });
+    return true;
+};
+
+/**
+* Reset timeban for user and output result to browser
+* @param {params} params - params object
+* @returns {boolean} true if timeban reseted
+**/
+usersApi.resetTimeBan = function(params) {
+    common.db.collection('failed_logins').remove({_id: {$in: preventBruteforce.loginCounterIds(params.qstring.username)}}, (err) => {
+        if (err) {
+            common.returnMessage(params, 500, 'Remove from collection failed.');
+            return false;
+        }
+
+        common.returnOutput(params, true);
+    });
+
+
+    return true;
+};
+
+/**
+* Create new dashboard user and output result to browser
+* @param {params} params - params object
+* @returns {boolean} true if user created
+**/
+usersApi.createUser = async function(params) {
+    var argProps = {
+            'full_name': {
+                'required': true,
+                'type': 'String'
+            },
+            'username': {
+                'required': true,
+                'type': 'String'
+            },
+            'password': {
+                'required': true,
+                'type': 'String',
+                'min-length': plugins.getConfig("security").password_min,
+                'has-number': plugins.getConfig("security").password_number,
+                'has-upchar': plugins.getConfig("security").password_char,
+                'has-special': plugins.getConfig("security").password_symbol
+            },
+            'email': {
+                'required': true,
+                'type': 'String'
+            },
+            'lang': {
+                'required': false,
+                'type': 'String'
+            },
+            'permission': {
+                'required': false,
+                'type': 'Object'
+            },
+            'admin_of': {
+                'required': false,
+                'type': 'Array'
+            },
+            'user_of': {
+                'required': false,
+                'type': 'Array'
+            },
+            'global_admin': {
+                'required': false,
+                'type': 'Boolean'
+            }
+        },
+        newMember = {};
+
+    await depCheck(params);
+    var createUserValidation = common.validateArgs(params.qstring.args, argProps, true);
+    if (!(newMember = createUserValidation.obj)) {
+        common.returnMessage(params, 400, createUserValidation.errors);
+        return false;
+    }
+
+    //adding backwards compatability
+    newMember.permission = newMember.permission || {};
+
+    if (!newMember.permission._) {
+        newMember.permission._ = {
+            a: newMember.admin_of || [],
+            u: newMember.user_of ? [newMember.user_of] : []
+        };
+    }
+
+    if (newMember.admin_of) {
+        if (Array.isArray(newMember.admin_of) && newMember.admin_of.length) {
+            newMember.permission.c = newMember.permission.c || {};
+            newMember.permission.r = newMember.permission.r || {};
+            newMember.permission.u = newMember.permission.u || {};
+            newMember.permission.d = newMember.permission.d || {};
+            for (let i = 0; i < newMember.admin_of.length; i++) {
+                newMember.permission.c[newMember.admin_of[i]] = newMember.permission.c[newMember.admin_of[i]] || {all: true, allowed: {}};
+                newMember.permission.r[newMember.admin_of[i]] = newMember.permission.r[newMember.admin_of[i]] || {all: true, allowed: {}};
+                newMember.permission.u[newMember.admin_of[i]] = newMember.permission.u[newMember.admin_of[i]] || {all: true, allowed: {}};
+                newMember.permission.d[newMember.admin_of[i]] = newMember.permission.d[newMember.admin_of[i]] || {all: true, allowed: {}};
+            }
+        }
+        delete newMember.admin_of;
+    }
+
+    if (newMember.user_of) {
+        if (Array.isArray(newMember.user_of) && newMember.user_of.length) {
+            newMember.permission.r = newMember.permission.r || {};
+            for (let i = 0; i < newMember.user_of.length; i++) {
+                newMember.permission.r[newMember.user_of[i]] = newMember.permission.r[newMember.user_of[i]] || {all: true, allowed: {}};
+            }
+        }
+        delete newMember.user_of;
+    }
+
+    common.db.collection('members').findOne({ $or: [{ email: newMember.email }, { username: newMember.username }] }, function(err, member) {
+        if (member || err) {
+            common.returnMessage(params, 400, ['Email or username already exists']);
+            return false;
+        }
+        else {
+            createUser();
+            return true;
+        }
+    });
+
+    /**
+    * Creates user document with hashed password
+    **/
+    async function createUser() {
+        //var passwordNoHash = newMember.password;
+        var secret = countlyConfig.passwordSecret || "";
+        var accessTypes = ["c", "r", "u", "d"];
+        newMember.password = await common.argon2Hash(newMember.password + secret);
+        newMember.password_changed = 0;
+        newMember.created_at = Math.floor(((new Date()).getTime()) / 1000); //TODO: Check if UTC
+        for (var type in accessTypes) {
+            if (typeof newMember.permission[accessTypes[type]] === "undefined") {
+                newMember.permission[accessTypes[type]] = {};
+            }
+        }
+        newMember.locked = false;
+        newMember.username = newMember.username.trim();
+        newMember.email = newMember.email.trim().toString().toLowerCase();
+        crypto.randomBytes(48, function(errorBuff, buffer) {
+            newMember.api_key = common.md5Hash(buffer.toString('hex') + Math.random());
+            common.db.collection('members').insert(newMember, function(err, member) {
+                if (!err && member && member.ops) {
+                    member = member.ops;
+                }
+                else {
+                    console.log('Error creating user: ', err);
+                }
+                if (member && member.length && !err) {
+                    // The previous derivation was sha512Hash(username + full_name, timestamp).
+                    // sha512Hash treats its second arg as a *boolean* addSalt flag (see
+                    // sha512Hash() below), so the actual HMAC key was Date.now() ms — a tiny
+                    // attacker-discoverable keyspace given an estimated send time. Combined
+                    // with attacker-knowable username/full_name, this enabled new-member
+                    // invite token recovery and account takeover before the legitimate user
+                    // clicked the link. Use crypto.randomBytes(32) instead — same approach
+                    // already used by the password-reset flow in frontend/express/libs/members.js.
+                    var timestamp = Math.round(new Date().getTime() / 1000),
+                        prid = crypto.randomBytes(32).toString('hex');
+                    common.db.collection('password_reset').insert({"prid": prid, "user_id": member[0]._id, "timestamp": timestamp, "newInvite": true}, {safe: true}, function() {
+                        mail.sendToNewMemberLink(member[0], prid);
+                    });
+
+                    // Broadcast a credential-free copy of the new member to
+                    // event listeners (e.g. hooks): the member's password hash
+                    // and api_key must never be forwarded into a hook payload.
+                    var createdMemberEventData = Object.assign({}, member[0]);
+                    delete createdMemberEventData.password;
+                    delete createdMemberEventData.api_key;
+                    plugins.dispatch("/i/users/create", {
+                        params: params,
+                        data: createdMemberEventData
+                    });
+                    delete member[0].password;
+
+                    common.returnOutput(params, member[0]);
+                }
+                else {
+                    common.returnMessage(params, 400, ['Error creating user']);
+                }
+            });
+        });
+    }
+
+    return true;
+};
+
+/**
+    * Removes all active sessions and tokens of a user
+    * @param {string} userId - id of the user for which to remove sessions
+    * @returns {Promise} resolves once the tokens are revoked
+    **/
+function killAllSessionForUser(userId) {
+    const userIdString = userId + "";
+    common.db.collection('sessions_').find({"session": { $regex: userIdString }}).toArray(function(err, sessions) {
+
+        var delete_us = [];
+        sessions = sessions || [];
+        for (let i = 0; i < sessions.length; i++) {
+            var parsed_data = "";
+            try {
+                parsed_data = JSON.parse(sessions[i].session);
+            }
+            catch {
+                console.log('Parse ' + sessions[i].session + ' JSON failed');
+            }
+            if (parsed_data && (parsed_data.uid + "") === userIdString) {
+                delete_us.push(sessions[i]._id);
+            }
+        }
+        if (delete_us.length > 0) {
+            common.db.collection('sessions_').remove({ '_id': { $in: delete_us } });
+        }
+    });
+    //every token the member owns: used when an admin sets the password, locks the member,
+    //and when the member is deleted
+    return authorize.revokeMemberTokens({db: common.db, owner: userIdString}).catch(function(err) {
+        console.log('Revoking tokens of member ' + userIdString + ' failed', err);
+    });
+
+}
+
+usersApi.updateHomeSettings = function(params) {
+    params = params || {};
+    params.qstring = params.qstring || {};
+    if (!params.member) {
+        common.returnMessage(params, 400, 'Could not get member');
+    }
+    else if (!params.qstring.homeSettings) {
+        common.returnMessage(params, 400, '`homeSettings` should contain stringified object with home settings');
+    }
+    else if (!params.qstring.app_id) {
+        common.returnMessage(params, 400, '`app_id` must be passed');
+    }
+    else {
+        try {
+            params.qstring.homeSettings = JSON.parse(params.qstring.homeSettings);
+        }
+        catch {
+            params.qstring.homeSettings = {};
+        }
+        var updateObj = {};
+        updateObj["homeSettings." + params.qstring.app_id] = params.qstring.homeSettings;
+        common.db.collection('members').update({_id: common.db.ObjectID(params.member._id + "")}, {"$set": updateObj}, function(err3 /* , res1*/) {
+            if (err3) {
+                console.log(err3);
+                common.returnMessage(params, 400, 'Mongo error');
+            }
+            else {
+                common.returnMessage(params, 200, 'Success');
+            }
+        });
+    }
+};
+
+
+/**
+ * Checks the permission dependencies of features for each app based on the enabled features, enabling the required permission dependencies if necessary.
+ * @param {object} params - params object.
+*/
+async function depCheck(params) {
+    var features = ["core", "events" /* , "global_configurations", "global_applications", "global_users", "global_jobs", "global_upload" */];
+    var featuresPermissionDependency = {};
+    plugins.dispatch("/permissions/features", { params: params, features: features, featuresPermissionDependency: featuresPermissionDependency }, function() {
+        //read permission check, making sure that read is present in every dependency array if any other permission is given
+        for (var feature in featuresPermissionDependency) {
+            var perms = Object.keys(featuresPermissionDependency[feature]);
+            for (var perm of perms) {
+                var permFeatures = Object.keys(featuresPermissionDependency[feature][perm]);
+                for (var permFeature of permFeatures) {
+                    var targetAr = featuresPermissionDependency[feature][perm][permFeature];
+                    if (targetAr.length && targetAr.indexOf('r') === -1) {
+                        featuresPermissionDependency[feature][perm][permFeature].push('r');
+                    }
+                }
+            }
+        }
+        //check permission dependency for each app
+        const crudTypes = ["c", "r", "u", "d"];
+        crudTypes.forEach(function(crudType) {
+            let apps = params.qstring.args && params.qstring.args.permission && params.qstring.args.permission[crudType] || {};
+            Object.keys(apps).forEach(function(app) {
+                let feats = apps[app].allowed || {};
+                Object.keys(feats).forEach(function(feat) {
+                    let featEnabled = feats[feat];
+                    //check if feature is enabled and if it has any dependency
+                    if (featEnabled && featuresPermissionDependency[feat] && featuresPermissionDependency[feat][crudType]) {
+                        let depFeats = featuresPermissionDependency[feat][crudType];
+                        Object.keys(depFeats).forEach(function(depFeat) {
+                            depFeats[depFeat].forEach(function(crudPerm) {
+                                //add dependency permissions
+                                params.qstring.args.permission[crudPerm][app].allowed[depFeat] = true;
+                            });
+                        });
+                    }
+                });
+            });
+        });
+    });
+}
+
+/**
+* Updates dashboard user's data and output result to browser
+* @param {params} params - params object
+* @returns {boolean} true if user was updated
+**/
+usersApi.updateUser = async function(params) {
+    var argProps = {
+            'user_id': {
+                'required': true,
+                'type': 'String',
+                'exclude-from-ret-obj': true
+            },
+            'full_name': {
+                'required': false,
+                'type': 'String'
+            },
+            'username': {
+                'required': false,
+                'type': 'String'
+            },
+            'password': {
+                'required': false,
+                'type': 'String',
+                'min-length': plugins.getConfig("security").password_min,
+                'has-number': plugins.getConfig("security").password_number,
+                'has-upchar': plugins.getConfig("security").password_char,
+                'has-special': plugins.getConfig("security").password_symbol
+            },
+            'email': {
+                'required': false,
+                'type': 'String'
+            },
+            'lang': {
+                'required': false,
+                'type': 'String'
+            },
+            'admin_of': {
+                'required': false,
+                'type': 'Array'
+            },
+            'user_of': {
+                'required': false,
+                'type': 'Array'
+            },
+            'global_admin': {
+                'required': false,
+                'type': 'Boolean'
+            },
+            'locked': {
+                'required': false,
+                'type': 'Boolean'
+            },
+            'send_notification': {
+                'required': false,
+                'type': 'Boolean',
+                'exclude-from-ret-obj': true
+            },
+            'permission': {
+                'required': false,
+                'type': 'Object'
+            },
+            'subscribe_newsletter': {
+                'required': false,
+                'type': 'Boolean'
+            },
+        },
+        updatedMember = {},
+        passwordNoHash = "";
+
+    await depCheck(params);
+    var updateUserValidation = common.validateArgs(params.qstring.args, argProps, true);
+    if (!(updatedMember = updateUserValidation.obj)) {
+        common.returnMessage(params, 400, updateUserValidation.errors);
+        return false;
+    }
+
+    if (updatedMember.password) {
+        var secret = countlyConfig.passwordSecret || "";
+        passwordNoHash = updatedMember.password;
+        updatedMember.password = await common.argon2Hash(updatedMember.password + secret);
+        if (params.member._id !== params.qstring.args.user_id) {
+            updatedMember.password_changed = 0;
+        }
+    }
+    if (updatedMember.username) {
+        updatedMember.username = updatedMember.username.trim();
+    }
+    if (updatedMember.email) {
+        updatedMember.email = updatedMember.email.trim().toString().toLowerCase();
+    }
+
+    if (params.qstring.args.member_image && params.qstring.args.member_image === 'delete') {
+        updatedMember.member_image = "";
+    }
+
+    //adding backwards compatability
+    if (updatedMember.admin_of) {
+        if (Array.isArray(updatedMember.admin_of) && updatedMember.admin_of.length) {
+            updatedMember.permission = updatedMember.permission || {};
+            if (!updatedMember.permission._) {
+                updatedMember.permission._ = {};
+            }
+            updatedMember.permission._.a = updatedMember.admin_of;
+            updatedMember.permission.c = updatedMember.permission.c || {};
+            updatedMember.permission.r = updatedMember.permission.r || {};
+            updatedMember.permission.u = updatedMember.permission.u || {};
+            updatedMember.permission.d = updatedMember.permission.d || {};
+            for (let i = 0; i < updatedMember.admin_of.length; i++) {
+                updatedMember.permission.c[updatedMember.admin_of[i]] = updatedMember.permission.c[updatedMember.admin_of[i]] || {all: true, allowed: {}};
+                updatedMember.permission.r[updatedMember.admin_of[i]] = updatedMember.permission.r[updatedMember.admin_of[i]] || {all: true, allowed: {}};
+                updatedMember.permission.u[updatedMember.admin_of[i]] = updatedMember.permission.u[updatedMember.admin_of[i]] || {all: true, allowed: {}};
+                updatedMember.permission.d[updatedMember.admin_of[i]] = updatedMember.permission.d[updatedMember.admin_of[i]] || {all: true, allowed: {}};
+            }
+        }
+        delete updatedMember.admin_of;
+    }
+
+    if (updatedMember.user_of) {
+        if (Array.isArray(updatedMember.user_of) && updatedMember.user_of.length) {
+            updatedMember.permission = updatedMember.permission || {};
+            if (!updatedMember.permission._) {
+                updatedMember.permission._ = {};
+            }
+            updatedMember.permission._.u = [updatedMember.user_of];
+            updatedMember.permission.r = updatedMember.permission.r || {};
+            for (let i = 0; i < updatedMember.user_of.length; i++) {
+                updatedMember.permission.r[updatedMember.user_of[i]] = updatedMember.permission.r[updatedMember.user_of[i]] || {all: true, allowed: {}};
+            }
+        }
+        delete updatedMember.user_of;
+    }
+
+    //a permission sent without its app lists gets them here, as it does on creation: the rights
+    //checks read permission._, so a member saved without it was refused on every app admin call
+    if (updatedMember.permission) {
+        if (typeof updatedMember.permission._ !== "object" || updatedMember.permission._ === null) {
+            updatedMember.permission._ = {};
+        }
+        if (!Array.isArray(updatedMember.permission._.a)) {
+            updatedMember.permission._.a = [];
+        }
+        if (!Array.isArray(updatedMember.permission._.u)) {
+            updatedMember.permission._.u = [];
+        }
+        ["c", "r", "u", "d"].forEach(function(accessType) {
+            if (typeof updatedMember.permission[accessType] !== "object" || updatedMember.permission[accessType] === null) {
+                updatedMember.permission[accessType] = {};
+            }
+        });
+    }
+
+    common.db.collection('members').findOne({ '_id': common.db.ObjectID(params.qstring.args.user_id) }, function(err, memberBefore) {
+        common.db.collection('members').update({ '_id': common.db.ObjectID(params.qstring.args.user_id) }, { '$set': updatedMember }, { safe: true }, function(errUpdatingUser) {
+            if (errUpdatingUser) {
+                common.returnMessage(params, 500, 'Error updating user. Please check api logs.');
+                return false;
+            }
+            common.db.collection('members').findOne({ '_id': common.db.ObjectID(params.qstring.args.user_id) }, function(err2, member) {
+                if (member && !err2) {
+                    updatedMember._id = params.qstring.args.user_id;
+                    // never forward credentials into event payloads (e.g. hooks)
+                    var updatedMemberEventData = Object.assign({}, updatedMember);
+                    delete updatedMemberEventData.password;
+                    delete updatedMemberEventData.api_key;
+                    var memberBeforeEventData = Object.assign({}, memberBefore);
+                    delete memberBeforeEventData.password;
+                    delete memberBeforeEventData.api_key;
+                    plugins.dispatch("/i/users/update", {
+                        params: params,
+                        data: updatedMemberEventData,
+                        member: memberBeforeEventData
+                    });
+                    if (params.qstring.args.send_notification && passwordNoHash) {
+                        mail.sendToUpdatedMember(member, passwordNoHash);
+                    }
+                    //a new password or a new lock ends the member's sessions and tokens, so unlocking
+                    //does not bring them back; never the session of the admin saving it
+                    var newlyLocked = updatedMember.locked === true && !(memberBefore && memberBefore.locked === true);
+                    if ((updatedMember.password || newlyLocked) && params.member._id + "" !== updatedMember._id + "") {
+                        killAllSessionForUser(updatedMember._id);
+                    }
+
+                    if (updatedMember.email) {
+                        //remove password reset e-mail
+                        common.db.collection('password_reset').remove({ "user_id": common.db.ObjectID(updatedMember._id + "")}, {multi: true}, function() {});
+                    }
+                    common.returnMessage(params, 200, 'Success');
+                }
+                else {
+                    common.returnMessage(params, 500, 'Error updating user');
+                }
+            });
+        });
+    });
+
+    return true;
+};
+
+/**
+* Deletes dashboard user and output result to browser
+* @param {params} params - params object
+* @returns {boolean} true if user was deleted
+**/
+usersApi.deleteUser = async function(params) {
+    var argProps = {
+            'user_ids': {
+                'required': true,
+                'type': 'Array'
+            }
+        },
+        fails = 0,
+        userIds = [];
+
+    var deleteUserValidation = common.validateArgs(params.qstring.args, argProps, true);
+    if (!(deleteUserValidation.obj && (userIds = deleteUserValidation.obj.user_ids))) {
+        common.returnMessage(params, 400, 'Error: ' + deleteUserValidation.errors);
+        return false;
+    }
+
+    for (var i = 0; i < userIds.length; i++) {
+        //a user can't delete his own account
+        //string id can also exist due to cognito, so no check for 24 chars length
+        if (!userIds[i] || userIds[i] === params.member._id + "") {
+            continue;
+        }
+        else {
+            const user = await common.db.collection('members').findOne({ '_id': common.db.ObjectID(userIds[i]) });
+            const promisifiedDispatch = function(prms, data) {
+                // never forward credentials into event payloads (e.g. hooks)
+                var safeData = Object.assign({}, data);
+                delete safeData.password;
+                delete safeData.api_key;
+                return new Promise((resolve, reject) => {
+                    plugins.dispatch("/i/users/delete", {
+                        params: prms,
+                        data: safeData,
+                    }, async(__, otherPluginResults) => {
+                        const rejectReasons = otherPluginResults.reduce((acc, result) => {
+                            if (result.status === "rejected") {
+                                acc.push((result.reason && result.reason.message) || '');
+                            }
+
+                            return acc;
+                        }, []);
+
+                        if (rejectReasons.length > 0) {
+                            log.e("User " + userIds[i] + " deletion failed\n%j", rejectReasons.join("\n"));
+                            fails += 1;
+                            reject(false);
+                        }
+                        else {
+                            await killAllSessionForUser(userIds[i]);
+                            await usersApi.deleteUserNotes({ member: { _id: userIds[i] } });
+                            await common.db.collection('members').remove({_id: common.db.ObjectID(userIds[i])});
+                            deleteUserPresets(userIds[i]);
+                            resolve(true);
+                        }
+                    });
+                });
+            };
+
+            await promisifiedDispatch(params, user);
+        }
+    }
+
+    if (fails === 0) {
+        common.returnMessage(params, 200, 'Success');
+        return true;
+    }
+    else if (fails === userIds.length) {
+        common.returnMessage(params, 500, 'User deletion failed, please see logs for more detail');
+        return false;
+    }
+    else {
+        common.returnMessage(params, 200, 'Some users cannot be deleted, please see logs for more detail');
+        return true;
+    }
+};
+
+// created functions below are for account deletion. when merging together with next should remove  and include from members utility !!!!!! 
+
+/**
+ * Is hashed string argon2?
+ * @param {string} hashedStr | argon2 hashed string
+ * @returns {boolean} return true if string hashed by argon2
+ */
+function isArgon2Hash(hashedStr) {
+    return hashedStr.includes("$argon2");
+}
+
+/**
+* Verify argon2 hash string
+* @param {string} hashedStr - argon2 hashed string
+* @param {string} str - string for verify
+* @returns {promise} verify promise
+**/
+function verifyArgon2Hash(hashedStr, str) {
+    return argon2.verify(hashedStr, str);
+}
+
+/**
+* Create sha1 hash string
+* @param {string} str - string to hash
+* @param {boolean} addSalt - should salt be added
+* @returns {string} hashed string
+**/
+function sha1Hash(str, addSalt) {
+    var salt = (addSalt) ? new Date().getTime() : "";
+    return crypto.createHmac('sha1', salt + "").update(str + "").digest('hex');
+}
+
+/**
+* Create sha512 hash string
+* @param {string} str - string to hash
+* @param {boolean} addSalt - should salt be added
+* @returns {string} hashed string
+**/
+function sha512Hash(str, addSalt) {
+    var salt = (addSalt) ? new Date().getTime() : "";
+    return crypto.createHmac('sha512', salt + "").update(str + "").digest('hex');
+}
+
+/**
+* Update user password to new sha512 hash
+* @param {string} id - id of the user document
+* @param {string} password - password to hash
+**/
+function updateUserPasswordToArgon2(id, password) {
+    common.db.collection('members').update({ _id: id}, { $set: { password: password}});
+}
+
+/**
+* Create argon2 hash string
+* @param {string} str - string to hash
+* @returns {promise} hash promise
+**/
+function argon2Hash(str) {
+    return argon2.hash(str);
+}
+
+
+/**
+ * Verify member for Argon2 Hash
+ * @param {string} username | User name
+ * @param {password} password | Password string
+ * @param {Function} callback | Callback function
+ */
+function verifyMemberArgon2Hash(username, password, callback) {
+    common.db.collection('members').findOne({$and: [{ $or: [ {"username": username}, {"email": username}]}]}, (err, member) => {
+        if (member) {
+            if (isArgon2Hash(member.password)) {
+                verifyArgon2Hash(member.password, password).then(match => {
+                    if (match) {
+                        callback(undefined, member);
+                    }
+                    else {
+                        callback("Password is wrong!");
+                    }
+                }).catch(function() {
+                    callback("Password is wrong!");
+                });
+            }
+            else {
+                var password_SHA1 = sha1Hash(password);
+                var password_SHA5 = sha512Hash(password);
+
+                if (member.password === password_SHA1 || member.password === password_SHA5) {
+                    argon2Hash(password).then(password_ARGON2 => {
+                        updateUserPasswordToArgon2(member._id, password_ARGON2);
+                        callback(undefined, member);
+                    }).catch(function() {
+                        callback("Password is wrong!");
+                    });
+                }
+                else {
+                    callback("Password is wrong!");
+                }
+            }
+        }
+        else {
+            callback("Username is wrong!");
+        }
+    });
+}
+
+/**
+ * Delete user's date presets
+ * @param {string} memberId | User id
+ */
+function deleteUserPresets(memberId) {
+    common.db.collection("date_presets").remove({owner: memberId + ""}, function() {
+        //handle errors
+    });
+}
+
+// END of reused functions 
+
+
+usersApi.deleteOwnAccount = function(params) {
+    if (params.qstring.password && params.qstring.password !== "") {
+        verifyMemberArgon2Hash(params.member.email, params.qstring.password, (err, member) => {
+            const dispatchDeleteCallback = async function(__, otherPluginResults) {
+                const rejectReasons = otherPluginResults.reduce((acc, result) => {
+                    if (result.status === "rejected") {
+                        acc.push((result.reason && result.reason.message) || '');
+                    }
+
+                    return acc;
+                }, []);
+
+                if (rejectReasons.length > 0) {
+                    log.e("User deletion failed\n%j", rejectReasons.join("\n"));
+                    common.returnMessage(params, 500, { errorMessage: "User deletion failed. Failed to delete some data related to this user." });
+                }
+                else {
+                    try {
+                        await common.db.collection('members').remove({_id: common.db.ObjectID(member._id + "")});
+                        await killAllSessionForUser(member._id);
+                        deleteUserPresets(member._id);
+                        common.returnMessage(params, 200, 'Success');
+                    }
+                    catch (err1) {
+                        console.log(err1);
+                        common.returnMessage(params, 400, 'Mongo error');
+                    }
+                }
+            };
+
+            if (member) {
+                // never forward credentials into event payloads (e.g. hooks)
+                var memberEventData = Object.assign({}, member);
+                delete memberEventData.password;
+                delete memberEventData.api_key;
+                if (member.global_admin) {
+                    common.db.collection('members').count({'global_admin': true}, function(err2, count) {
+                        if (err2) {
+                            console.log(err2);
+                            common.returnMessage(params, 400, 'Mongo error');
+                        }
+                        if (count < 2) {
+                            common.returnMessage(params, 400, 'global admin limit');
+                        }
+                        else {
+                            plugins.dispatch("/i/users/delete", {
+                                params: params,
+                                data: memberEventData
+                            }, dispatchDeleteCallback);
+                        }
+                    });
+                }
+                else {
+                    plugins.dispatch("/i/users/delete", {
+                        params: params,
+                        data: memberEventData
+                    }, dispatchDeleteCallback);
+                }
+            }
+            else {
+                common.returnMessage(params, 400, 'password not valid');
+            }
+        });
+    }
+    else {
+        common.returnMessage(params, 400, 'password mandatory');
+    }
+    return true;
+
+};
+
+module.exports = usersApi;
+/**
+ * Check update or delete note permission.
+ *  @param {params} params - params object 
+ *  @returns {boolean} true
+ */
+usersApi.checkNoteEditPermission = async function(params) {
+    let noteId = params.qstring.note_id;
+    /**
+     * get note
+     *  @returns {object} promise
+     */
+    const checkPermission = () => {
+        return new Promise((resolve, reject) => {
+            common.db.collection('notes').findOne(
+                { '_id': common.db.ObjectID(noteId)},
+                function(error, note) {
+                    if (error) {
+                        return reject(false);
+                    }
+                    if (!note) {
+                        return resolve(false);
+                    }
+                    const globalAdmin = params.member.global_admin;
+                    // Permission is checked against the NOTE's stored app_id, not the
+                    // app_id in the request's query string. Otherwise a user who is
+                    // app-admin of A can edit/delete notes that belong to B by passing
+                    // app_id=A in the qstring while targeting note_id=<B's note>.
+                    const isAppAdmin = hasAdminAccess(params.member, note.app_id + "");
+                    const noteOwner = (note.owner + '' === params.member._id + '');
+                    return resolve(noteOwner || (isAppAdmin && note.noteType === 'public') || (globalAdmin && note.noteType === 'public'));
+                }
+            );
+        });
+    };
+    if (params.qstring.args && params.qstring.args._id) {
+        noteId = params.qstring.args._id;
+    }
+    const permit = await checkPermission();
+    return permit;
+};
+
+/**
+* Create or update note
+* @param {params} params - params object
+* @returns {boolean} true
+**/
+usersApi.saveNote = async function(params) {
+    var argProps = {
+        'note': {
+            'required': true,
+            'type': 'String'
+        },
+        'ts': {
+            'required': true,
+            'type': 'IntegerString'
+        },
+        'noteType': {
+            'required': true,
+            'type': 'String',
+        },
+        'color': {
+            // Frontend (countly.common.notes.js COLOR_TAGS) sends a numeric
+            // index 1..5. URL query callers may send "5" as a string.
+            // Mirror the ts handling — IntegerString accepts both.
+            'required': true,
+            'type': 'IntegerString'
+        },
+        'category': {
+            'required': false,
+            'type': 'Boolean'
+        }
+    };
+    const args = params.qstring.args;
+    const noteValidation = common.validateArgs(args, argProps, true);
+    if (!noteValidation.result) {
+        common.returnMessage(params, 400, 'Invalid note: ' + (noteValidation.errors && noteValidation.errors.join('; ')));
+        return false;
+    }
+
+    // Bind the note to the app_id we already permission-checked
+    // (params.qstring.app_id, against which validateCreate ran). Trusting
+    // args.app_id would let a user with create-rights on app A write notes
+    // attached to app B by passing args.app_id=B.
+    const note = {
+        app_id: params.qstring.app_id + "",
+        note: args.note,
+        ts: args.ts,
+        noteType: args.noteType,
+        emails: args.emails || [],
+        color: args.color,
+        category: args.category,
+        owner: params.member._id + "",
+        created_at: new Date().getTime(),
+        updated_at: new Date().getTime()
+    };
+
+    if (args._id) {
+        const editPermission = await usersApi.checkNoteEditPermission(params);
+        if (!editPermission) {
+            common.returnMessage(params, 403, 'Not allow to edit note');
+        }
+        else {
+            delete note.created_at;
+            delete note.owner;
+            common.db.collection('notes').update({_id: common.db.ObjectID(args._id)}, {$set: note }, (err) => {
+                if (err) {
+                    common.returnMessage(params, 503, 'Save note failed');
+                }
+                else {
+                    common.returnMessage(params, 200, 'Success');
+                }
+            });
+        }
+    }
+    else {
+        common.db.collection('notes').find({ "app_id": note.app_id }).sort({ "created_at": -1 }).limit(1).project({ "indicator": 1 }).toArray(function(err, res) {
+            if (err) {
+                common.returnMessage(params, 503, 'Save note failed');
+            }
+            else {
+                if (res && res.length) {
+                    note.indicator = countlyCommon.stringIncrement(res[0].indicator);
+                }
+                else {
+                    note.indicator = "A";
+                }
+                common.db.collection('notes').insert(note, (_err) => {
+                    if (_err) {
+                        common.returnMessage(params, 503, 'Insert Note failed.');
+                    }
+                    common.returnMessage(params, 200, 'Success');
+                });
+            }
+        });
+    }
+    return true;
+};
+
+/**
+* Delete Note
+* @param {params} params - params object
+* @returns {boolean} true
+**/
+usersApi.deleteNote = async function(params) {
+
+    const editPermission = await usersApi.checkNoteEditPermission(params);
+    if (!editPermission) {
+        common.returnMessage(params, 403, 'Not allow to delete this note');
+    }
+    else {
+        const noteId = params.qstring.note_id;
+        const query = {
+            '_id': common.db.ObjectID(noteId),
+        };
+        common.db.collection('notes').remove(query, function(error) {
+            if (error) {
+                common.returnMessage(params, 503, "Error deleting note");
+            }
+            common.returnMessage(params, 200, "Success");
+        });
+    }
+    return true;
+};
+
+/**
+* Delete deleted user note
+* @param {params} params - params object
+* @returns {boolean} true
+**/
+usersApi.deleteUserNotes = async function(params) {
+    const query = {
+        'owner': params.member._id + "",
+    };
+    common.db.collection('notes').remove(query, function(error) {
+        if (error) {
+            log.e("Error deleting removed users' note");
+        }
+    });
+    return true;
+};
+/**
+ * fetch apps id for those user can access;
+* @param {params} params - params object
+* @returns {array} app id array
+ */
+usersApi.fetchUserAppIds = async function(params) {
+    const query = {};
+    const appIds = [];
+    const adminApps = getAdminApps(params.member);
+    const userApps = getUserApps(params.member);
+    if (!params.member.global_admin) {
+        if (adminApps.length > 0) {
+            for (let i = 0; i < adminApps.length ;i++) {
+                if (adminApps[i] === "") {
+                    continue;
+                }
+                appIds.push(adminApps[i]);
+            }
+        }
+        if (userApps.length > 0) {
+            for (let i = 0; i < userApps.length ;i++) {
+                appIds.push(userApps[i]);
+            }
+        }
+    }
+    if (appIds.length > 0) {
+        query._id = {$in: appIds};
+    }
+    return appIds;
+};
+/**
+* fetch Notes
+* @param {params} params - params object
+* @returns {boolean} true
+**/
+usersApi.fetchNotes = async function(params) {
+    countlyCommon.getPeriodObj(params);
+    // const timestampRange = countlyCommon.getTimestampRangeQuery(params, false);
+
+    let appIds = [];
+    let filteredAppIds = [];
+    try {
+        appIds = JSON.parse(params.qstring.notes_apps);
+        if (!appIds || appIds.length === 0) {
+            appIds = await usersApi.fetchUserAppIds(params);
+        }
+        filteredAppIds = appIds.filter((appId) => {
+            if (hasAdminAccess(params.member, appId) || hasReadRight('core', appId, params.member)) {
+                return true;
+            }
+            return false;
+        });
+    }
+    catch (e) {
+        log.e(' got error while paring query notes appIds request', e);
+    }
+    const query = {
+        'app_id': {$in: filteredAppIds},
+        'ts': {$gte: params.qstring.period[0], $lte: params.qstring.period[1]},
+        $or: [
+            {'owner': params.member._id + ""},
+            {'noteType': 'public'},
+            {'emails': {'$in': [params.member.email] }},
+        ],
+    };
+
+    if (params.qstring.category) {
+        query.category = {$in: JSON.parse(params.qstring.category)};
+    }
+
+    if (params.qstring.note_type) {
+        query.noteType = params.qstring.note_type;
+    }
+
+    let skip = params.qstring.iDisplayStart || 0;
+    let limit = params.qstring.iDisplayLength || 5000;
+    const sEcho = params.qstring.sEcho || 1;
+    const orderDirection = {'asc': 1, 'desc': -1};
+    const orderByKey = {'3': 'noteType', '2': 'ts'};
+    let sortBy = {};
+    if (params.qstring.sSearch) {
+        // Cap input length and escape regex metacharacters before
+        // constructing the RegExp. Without this, a pattern like "^(a+)+$"
+        // can stall the worker (and the per-collection Mongo regex scan)
+        // for any caller with notes:read.
+        var rawSearch = (params.qstring.sSearch + "").slice(0, 256);
+        var escapedSearch = rawSearch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+        query.note = {$regex: new RegExp(escapedSearch, "i")};
+
+    }
+    if (params.qstring.iSortCol_0 && params.qstring.iSortCol_0 !== '0') {
+        Object.assign(sortBy, { [orderByKey[params.qstring.iSortCol_0]]: orderDirection[params.qstring.sSortDir_0]});
+    }
+    try {
+        skip = parseInt(skip, 10);
+        limit = parseInt(limit, 10);
+    }
+    catch (e) {
+        log.e(' got error while paring query notes request', e);
+    }
+    let count = 0;
+
+    common.db.collection('notes').count(query, function(error, noteCount) {
+        if (!error && noteCount) {
+            count = noteCount;
+            common.db.collection('notes').find(query)
+                .sort(sortBy)
+                .skip(skip)
+                .limit(limit)
+                .toArray(function(err1, notes) {
+                    if (err1) {
+                        return common.returnMessage(params, 503, 'fatch notes failed');
+                    }
+                    let ownerIds = _.uniqBy(notes, 'owner');
+                    common.db.collection('members')
+                        .find({
+                            _id: {
+                                $in: ownerIds.map((n) => {
+                                    return common.db.ObjectID(n.owner);
+                                })
+                            }
+                        },
+                        {full_name: 1})
+                        .toArray(function(err2, members) {
+                            if (err2) {
+                                return common.returnMessage(params, 503, 'fatch countly members for notes failed');
+                            }
+                            notes = notes.map((n) => {
+                                n.owner_name = 'Anonymous';
+                                members.forEach((m) => {
+                                    if (n.owner === m._id + "") {
+                                        n.owner_name = m.full_name;
+                                    }
+                                });
+                                return n;
+                            });
+                            common.returnOutput(params, {aaData: notes, iTotalDisplayRecords: count, iTotalRecords: count, sEcho});
+                        });
+                });
+        }
+        else {
+            common.returnOutput(params, {aaData: [], iTotalDisplayRecords: 0, iTotalRecords: 0, sEcho});
+        }
+    });
+    return true;
+};
+
+usersApi.ackNotification = function(params) {
+    common.db.collection('members').updateOne({"_id": common.db.ObjectID(params.member._id)}, {$set: {['notes.' + params.qstring.path]: true}}, err => {
+        if (err) {
+            log.e('Error while acking member notification', err);
+            return common.returnMessage(params, 500, 'Unknown error');
+        }
+        else {
+            common.returnOutput(params, {['notes.' + params.qstring.path]: true});
+        }
+    });
+};
+
+module.exports = usersApi;
