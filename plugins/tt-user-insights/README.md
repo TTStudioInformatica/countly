@@ -2,6 +2,8 @@
 
 Modulo proprietario della suite **TT Analytics** di **TT Studio**, progettato per **Countly Server (`v25.03.0`)** seguendo il principio **Zero Core Modification**.
 
+> 🚀 **Nuovo sul progetto?** Inizia da **[`ONBOARDING.md`](./ONBOARDING.md)** per il percorso guidato di onboarding e la checklist rapida.
+
 ---
 
 ## 1. Panoramica Funzionale e User Activity Timeline
