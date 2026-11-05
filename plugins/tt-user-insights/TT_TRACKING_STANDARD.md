@@ -4,6 +4,8 @@ Specifica ufficiale di tracciamento per tutte le applicazioni **TT Studio** (Web
 
 > **Principio Fondamentale**: Lo standard **TT Analytics Tracking Standard v1** **non modifica** il protocollo nativo di Countly (`/i`), ma definisce le convenzioni su identificazione utente, sessioni, schermate (`[CLY]_view`) e Custom Events affinché la **User Activity Timeline** di `tt-user-insights` possa ricostruire in modo fedele e leggibile ogni attività dell'utente.
 
+Lato App (Web, iOS, Android o Backend) non serve cambiare SDK né chiamare endpoint custom: il plugin intercetta direttamente il normale traffico nativo di Countly (/i).
+
 ---
 
 ## 1. Identificazione Utente dopo il Login (`device_id` e `user_details`)
